@@ -1,32 +1,9 @@
 #include <syscall.h>
-
-#define PUBLIC __attribute__((visibility ("default")))
-#define PRIVATE __attribute__((visibility ("hidden")))
-
-PRIVATE void z_start(void);
-PRIVATE void z_trampo(void (*entry)(void), unsigned long *sp, void (*fini)(void));
-PRIVATE long z_syscall(int n, ...);
-PRIVATE void z_fdl_entry(void);
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-
-#include <fcntl.h>
 #include <unistd.h>
 
-#define z_errno (*z_perrno())
+#define PRIVATE __attribute__((visibility ("hidden")))
 
-void z_exit(int status);
-int z_open(const char *pathname, int flags);
-int z_close(int fd);
-int z_lseek(int fd, off_t offset, int whence);
-ssize_t z_read(int fd, void *buf, size_t count);
-ssize_t z_write(int fd, const void *buf, size_t count);
-void *z_mmap(void *addr, size_t length, int prot,
-			 int flags, int fd, off_t offset);
-int z_munmap(void *addr, size_t length);
-int z_mprotect(void *addr, size_t length, int prot);
-int *z_perrno(void);
+PRIVATE long z_syscall(int n, ...);
 
 static int errno;
 
