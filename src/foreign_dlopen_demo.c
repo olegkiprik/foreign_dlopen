@@ -1,18 +1,57 @@
 #include <elf.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+
+#define LONG_MAX 0x7fffFFFFffffFFFF
+#define ULONG_MAX 0xffffFFFFffffFFFFu
+#define INT_MAX 0x7fffFFFF
+#define UINT_MAX 0xffffFFFF
+
+#define ASSERT(x)                                                                                              \
+	do {                                                                                                   \
+		if (!(x)) {                                                                                    \
+			__builtin_unreachable();                                                               \
+		}                                                                                              \
+	} while (0)
 
 static int fdl_resolve_from_maps(unsigned long interp_base);
 static void *fdl_dlopen_sym(void *p);
 static void *fdl_dlsym_sym(void *p);
+
 static unsigned long g_interp_base = 0;
+static int gl_cached = 0;
+static unsigned long gl_cached_base = 0;
+static const char *gl_cached_name = NULL;
+static unsigned long text_base = 0;
+static const char *soname = NULL;
+static void *gl_g_fdl_dlopen = NULL;
+static void *gl_g_fdl_dlsym = NULL;
+static unsigned long *entry_sp =
+    NULL;		     /* Original sp (i.e. pointer to executable params) passed to entry, if any. */
+static void (*x_fini)(void); /* External fini function that the caller can provide us. */
 
 #if !defined(RTLD_NOW)
 #define RTLD_NOW 0x0002
 #endif
 
 static void sys_exit(int status);
+static long sys_openat(long dirfd, const void *restrict pathname, long flags, int *restrict result);
+static long sys_read(long fd, void *restrict buf, unsigned long nbytes, long *restrict result);
+static long sys_lseek(long fd, long offset, long whence, long *result);
+static long sys_mmap(void *restrict addr, unsigned long length, long prot, long flags, long fd, long offset,
+		     void **restrict result);
+static long sys_munmap(void *addr, unsigned long length);
+static long sys_mprotect(void *addr, size_t len, int prot);
+static long sys_close(long fd);
+
+static char *z_strstr(const char *h, const char *n);
+static int z_strcmp(const char *a, const char *b);
+static void *z_memcpy(void *dest, const void *src, size_t n);
+
+#define OFTEN(x) (__builtin_expect_with_probability((x), 1, 0.9))
+#define RARELY(x) (__builtin_expect_with_probability((x), 0, 0.9))
 
 // MUST ensure that stack is 16 byte aligned for calls to external functions
 // especially ones with variadic arguments. We do this via the z_fdlentry.S wrapper
@@ -25,34 +64,551 @@ void fdl_entry_impl(void)
 
 	void *m;
 	float (*my_sinf)(float);
+	int exit_status;
 
-	if (fdl_resolve_from_maps(g_interp_base) == 0) {
-		my_dlopen = fdl_dlopen_sym(NULL);
-		my_dlsym = fdl_dlsym_sym(NULL);
-		h = (*my_dlopen)(NULL, RTLD_NOW);
-		libc_printf = (*my_dlsym)(h, "printf");
+	exit_status = 0;
 
-		m = (*my_dlopen)("libm.so.6", RTLD_NOW);
-		if (m == NULL) {
-			sys_exit(1);
-		}
-
-		my_sinf = (*my_dlsym)(m, "sinf");
-		if (my_sinf == NULL) {
-			sys_exit(1);
-		}
-
-		if (libc_printf != NULL)
-			(*libc_printf)("sine of 3.14/3 is %f\n", (*my_sinf)(3.14 / 3));
+	if (RARELY(fdl_resolve_from_maps(g_interp_base) != 0)) {
+		goto l_exit;
 	}
+
+	my_dlopen = fdl_dlopen_sym(NULL);
+	my_dlsym = fdl_dlsym_sym(NULL);
+	h = (*my_dlopen)(NULL, RTLD_NOW);
+	libc_printf = (*my_dlsym)(h, "printf");
+
+	m = (*my_dlopen)("libm.so.6", RTLD_NOW);
+	if (RARELY(m == NULL)) {
+		goto l_exit_failure;
+	}
+
+	my_sinf = (*my_dlsym)(m, "sinf");
+	if (RARELY(my_sinf == NULL)) {
+		goto l_exit_failure;
+	}
+
+	if (RARELY(libc_printf == NULL)) {
+		goto l_exit_failure;
+	}
+
+	(*libc_printf)("sine of 3.14/3 is %f\n", (*my_sinf)(3.14 / 3));
+
+l_exit:
+	sys_exit(exit_status);
+
+l_exit_failure:
+	exit_status = 1;
+	goto l_exit;
+}
+
+__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char **argv);
+
+int main(int argc, char **argv)
+{
+	char *targv[2];
+	char *app;
+
+	if (argc > 1 && argv[1] != NULL && argv[1][0] != '\0') {
+		app = argv[1];
+	} else {
+		app = "/bin/sleep";
+	}
+
+	targv[0] = app;
+	targv[1] = "x";
+
+	exec_elf(app, sizeof targv / sizeof *targv, targv);
 	sys_exit(0);
 }
+
+#ifndef ELF_ST_TYPE
+#define ELF_ST_TYPE(i) ((i) & 0xF)
+#endif
+
+#ifndef MAPS_PATH
+#define MAPS_PATH "/proc/self/maps"
+#endif
+
+#if !defined(ELFCLASS)
+#define ELFCLASS ELFCLASS64
+#endif
+
+#if ELFCLASS == ELFCLASS64
+#define Elf_Ehdr Elf64_Ehdr
+#define Elf_Phdr Elf64_Phdr
+#define Elf_Sym Elf64_Sym
+#define Elf_Dyn Elf64_Dyn
+#define Elf_auxv_t Elf64_auxv_t
+#elif ELFCLASS == ELFCLASS32
+#define Elf_Ehdr Elf32_Ehdr
+#define Elf_Phdr Elf32_Phdr
+#define Elf_Sym Elf32_Sym
+#define Elf_Dyn Elf32_Dyn
+#define Elf_auxv_t Elf32_auxv_t
+#else
+#error "ELFCLASS is not defined"
+#endif
+
+static int check_ehdr(Elf_Ehdr *ehdr);
+static unsigned long loadelf_anon(int fd, Elf_Ehdr *restrict ehdr, Elf_Phdr *restrict phdr);
+static void z_fini(void);
+
+#define LOAD_ERR ((unsigned long)-1)
+#define z_alloca __builtin_alloca
+#define Z_PROG 0
+#define PRIVATE __attribute__((visibility("hidden")))
+#define Z_INTERP 1
+
+#define PAGE_SIZE 4096
+#define ALIGN (PAGE_SIZE - 1)
+#define ROUND_PG(x) (((x) + (ALIGN)) & ~(ALIGN))
+#define TRUNC_PG(x) ((x) & ~(ALIGN))
+#define PFLAGS(x)                                                                                              \
+	((((x) & PF_R) ? PROT_READ : 0) | (((x) & PF_W) ? PROT_WRITE : 0) | (((x) & PF_X) ? PROT_EXEC : 0))
+
+PRIVATE void z_fdl_entry(void);
+PRIVATE void z_trampo(void (*entry)(void), unsigned long *sp, void (*fini)(void));
 
 typedef union unn_syscall_result_ {
 	long l;
 	unsigned long ul;
 	void *p;
 } unn_syscall_result;
+
+__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char **argv)
+{
+	Elf_Ehdr ehdrs[2], *ehdr = ehdrs;
+	Elf_Phdr *phdr, *iter;
+	Elf_auxv_t *av;
+	char **env, **p, *elf_interp = NULL;
+	unsigned long *sp = entry_sp;
+	unsigned long base[2], entry[2];
+	ssize_t sz;
+	int fd, i;
+	long tmpres;
+
+	{
+		unsigned long *p = sp;
+		/* argc */
+		p++;
+		/* argv */
+		while (*p++ != 0)
+			;
+
+		unsigned long *from = p;
+		/* env */
+		while (*p++ != 0)
+			;
+		/* aux vector */
+		while (*p++ != 0) {
+			p++;
+		}
+		p++;
+
+		unsigned long argv_sz = argc * sizeof(*p);
+		unsigned sz = (char *)p - (char *)from;
+		p = alloca(sizeof(*p) + argv_sz + sz);
+		*p = argc;
+		z_memcpy(p + 1, argv, argv_sz);
+		z_memcpy((char *)(p + 1) + argv_sz, from, sz);
+		sp = p;
+		argv = (char **)sp + 1;
+	}
+
+	env = p = (char **)&argv[argc + 1];
+	while (*p++ != NULL)
+		;
+	av = (void *)p;
+
+	(void)env;
+
+	for (i = 0;; i++, ehdr++) {
+		/* Open file, read and than check ELF header.*/
+		if (RARELY(0 > sys_openat(AT_FDCWD, file, O_RDONLY, &fd))) {
+			goto l_exit_failure;
+		}
+
+		if (RARELY(0 > sys_read(fd, ehdr, sizeof *ehdr, &tmpres) || tmpres != sizeof *ehdr)) {
+			goto l_exit_failure;
+		}
+
+		if (RARELY(!check_ehdr(ehdr)))
+			goto l_exit_failure;
+
+		/* Read the program header. */
+		sz = ehdr->e_phnum * sizeof(Elf_Phdr);
+		phdr = z_alloca(sz);
+
+		if (RARELY(0 > sys_lseek(fd, ehdr->e_phoff, SEEK_SET, NULL))) {
+			goto l_exit_failure;
+		}
+
+		if (RARELY(0 > sys_read(fd, phdr, sz, &tmpres) || tmpres != sz)) {
+			goto l_exit_failure;
+		}
+
+		/* Time to load ELF. */
+		if (RARELY((base[i] = loadelf_anon(fd, ehdr, phdr)) == LOAD_ERR))
+			goto l_exit_failure;
+
+		/* Set the entry point, if the file is dynamic than add bias. */
+		entry[i] = ehdr->e_entry + (ehdr->e_type == ET_DYN ? base[i] : 0);
+		/* The second round, we've loaded ELF interp. */
+		if (file == elf_interp)
+			break;
+		for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
+			if (iter->p_type != PT_INTERP)
+				continue;
+			elf_interp = z_alloca(iter->p_filesz);
+
+			if (RARELY(0 > sys_lseek(fd, iter->p_offset, SEEK_SET, NULL))) {
+				goto l_exit_failure;
+			}
+
+			if (RARELY(0 > sys_read(fd, elf_interp, iter->p_filesz, &tmpres) ||
+				   tmpres != (ssize_t)iter->p_filesz)) {
+				goto l_exit_failure;
+			}
+
+			if (RARELY(elf_interp[iter->p_filesz - 1] != '\0'))
+				goto l_exit_failure;
+			// z_printf("elf_interp: %s\n", elf_interp);
+			file = elf_interp;
+		}
+		/* Looks like the ELF is static -- leave the loop. */
+		if (elf_interp == NULL)
+			break;
+	}
+
+	/* Reassign some vectors that are important for
+	 * the dynamic linker and for lib C. */
+	while (av->a_type != AT_NULL) {
+		switch (av->a_type) {
+		case AT_PHDR:
+			av->a_un.a_val = base[Z_PROG] + ehdrs[Z_PROG].e_phoff;
+			break;
+		case AT_PHNUM:
+			av->a_un.a_val = ehdrs[Z_PROG].e_phnum;
+			break;
+		case AT_PHENT:
+			av->a_un.a_val = ehdrs[Z_PROG].e_phentsize;
+			break;
+		case AT_ENTRY:
+			av->a_un.a_val = (unsigned long)z_fdl_entry;
+			break;
+		case AT_EXECFN:
+			av->a_un.a_val = (unsigned long)argv[1];
+			break;
+		case AT_BASE:
+			av->a_un.a_val = elf_interp ? base[Z_INTERP] : av->a_un.a_val;
+			break;
+		}
+		++av;
+	}
+
+	++av;
+
+	if (elf_interp) {
+		g_interp_base = base[Z_INTERP];
+	}
+
+	unn_syscall_result vp;
+	vp.ul = elf_interp ? entry[Z_INTERP] : entry[Z_PROG];
+
+	z_trampo(vp.p, sp, z_fini);
+
+	__builtin_unreachable();
+
+l_exit_failure:
+	sys_exit(1);
+}
+
+static void z_fini(void)
+{
+	if (x_fini != NULL)
+		(*x_fini)();
+}
+
+static int check_ehdr(Elf_Ehdr *ehdr)
+{
+	unsigned char *e_ident = ehdr->e_ident;
+	return (e_ident[EI_MAG0] != ELFMAG0 || e_ident[EI_MAG1] != ELFMAG1 || e_ident[EI_MAG2] != ELFMAG2 ||
+		e_ident[EI_MAG3] != ELFMAG3 || e_ident[EI_CLASS] != ELFCLASS ||
+		e_ident[EI_VERSION] != EV_CURRENT || (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN))
+		   ? 0
+		   : 1;
+}
+
+static unsigned long loadelf_anon(int fd, Elf_Ehdr *restrict ehdr, Elf_Phdr *restrict phdr)
+{
+	unsigned long minva, maxva;
+	Elf_Phdr *iter;
+	ssize_t sz;
+	int flags, dyn = ehdr->e_type == ET_DYN;
+	unsigned char *p, *base, *hint;
+	void *tmp;
+	long tmpres;
+
+	minva = (unsigned long)-1;
+	maxva = 0;
+
+	for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
+		if (iter->p_type != PT_LOAD)
+			continue;
+		if (iter->p_vaddr < minva)
+			minva = iter->p_vaddr;
+		if (iter->p_vaddr + iter->p_memsz > maxva)
+			maxva = iter->p_vaddr + iter->p_memsz;
+	}
+
+	minva = TRUNC_PG(minva);
+	maxva = ROUND_PG(maxva);
+
+	/* For dynamic ELF let the kernel chose the address. */
+	hint = dyn ? NULL : (void *)minva;
+	flags = dyn ? 0 : MAP_FIXED;
+	flags |= (MAP_PRIVATE | MAP_ANONYMOUS);
+
+	/* Check that we can hold the whole image. */
+	if (RARELY(0 > sys_mmap(hint, maxva - minva, PROT_NONE, flags, -1, 0, &tmp))) {
+		return -1;
+	}
+	base = tmp;
+	(void)sys_munmap(base, maxva - minva);
+
+	flags = MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE;
+	/* Now map each segment separately in precalculated address. */
+	for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
+		unsigned long off, start;
+		if (iter->p_type != PT_LOAD)
+			continue;
+		off = iter->p_vaddr & ALIGN;
+		start = dyn ? (unsigned long)base : 0;
+		start += TRUNC_PG(iter->p_vaddr);
+		sz = ROUND_PG(iter->p_memsz + off);
+
+		if (RARELY(0 > sys_mmap((void *)start, sz, PROT_READ | PROT_WRITE, flags, -1, 0, &tmp))) {
+			goto err;
+		}
+		p = tmp;
+
+		if (RARELY(0 > sys_lseek(fd, iter->p_offset, SEEK_SET, NULL))) {
+			goto err;
+		}
+
+		if (RARELY(0 > sys_read(fd, p + off, iter->p_filesz, &tmpres) ||
+			   (unsigned long)tmpres != iter->p_filesz)) {
+			goto err;
+		}
+
+		(void)sys_mprotect(p, sz, PFLAGS(iter->p_flags));
+	}
+
+	return (unsigned long)base;
+err:
+	(void)sys_munmap(base, maxva - minva);
+	return LOAD_ERR;
+}
+
+void z_entry(unsigned long *restrict sp, void (*fini)(void))
+{
+	int argc;
+	char **argv;
+
+	entry_sp = sp;
+	x_fini = fini;
+	argc = (int)*(sp);
+	argv = (char **)(sp + 1);
+	main(argc, argv);
+}
+
+/* parse one /proc/self/maps line; returns 0 on success */
+static int parse_maps_line(const char *line, unsigned long *start, char *perms_out, unsigned long *offset,
+			   const char **path_out)
+{
+	const char *p;
+	unsigned long v;
+	int i;
+
+	p = line;
+	v = 0;
+
+	/* start */
+	v = 0;
+	for (; *p >= '0' && *p <= '9' || *p >= 'a' && *p <= 'f' || *p >= 'A' && *p <= 'F'; p++)
+		v = v << 4 | (unsigned long)(*p <= '9' ? *p - '0' : *p >= 'a' ? 10 + *p - 'a' : 10 + *p - 'A');
+	if (RARELY(*p != '-'))
+		return -1;
+	*start = v;
+	p++;
+
+	/* end (skip) */
+	for (; *p >= '0' && *p <= '9' || *p >= 'a' && *p <= 'f' || *p >= 'A' && *p <= 'F'; p++)
+		;
+	while (*p == ' ')
+		p++;
+
+	/* perms (4 chars) */
+	for (i = 0; i < 4; i++) {
+		if (RARELY(!p[i]))
+			return -1;
+		perms_out[i] = p[i];
+	}
+	perms_out[4] = 0;
+	p += 4;
+	while (*p == ' ')
+		p++;
+
+	/* offset */
+	v = 0;
+	for (; *p >= '0' && *p <= '9' || *p >= 'a' && *p <= 'f' || *p >= 'A' && *p <= 'F'; p++)
+		v = v << 4 | (unsigned long)(*p <= '9' ? *p - '0' : *p >= 'a' ? 10 + *p - 'a' : 10 + *p - 'A');
+	*offset = v;
+
+	/* skip dev */
+	while (*p && *p != ' ')
+		p++;
+	while (*p == ' ')
+		p++;
+	/* skip inode */
+	while (*p && *p != ' ')
+		p++;
+	while (*p == ' ')
+		p++;
+
+	/* path (may be empty) */
+	*path_out = *p != '\0' ? p : NULL;
+	return 0;
+}
+
+/* In-memory ELF helpers */
+typedef struct {
+	Elf_Ehdr *eh;
+	Elf_Phdr *ph;
+	Elf_Dyn *dyn;
+	unsigned long base;
+	unsigned long nbucket, nchain;
+	uint32_t *buckets, *chains;
+	uint32_t *gnu_buckets;
+	uint32_t *gnu_chain;
+	uint32_t gnu_maskwords;
+	uint32_t gnu_shift2;
+	unsigned long *gnu_bloom;
+	uint32_t gnu_nbucket;
+	uint32_t gnu_symoffset;
+	Elf_Sym *dynsym;
+	const char *dynstr;
+	uint16_t *versym;
+} mod_t;
+
+static uint32_t sysv_hash(const char *s)
+{
+	uint32_t h;
+	uint32_t g;
+
+	h = 0;
+	while (*s) {
+		h = (h << 4) + (unsigned char)*s++;
+		g = h & 0xF0000000U;
+		if (g)
+			h ^= g >> 24;
+		h &= ~g;
+	}
+	return h;
+}
+
+static uint32_t gnu_hash_str(const char *s)
+{
+	uint32_t h = 5381;
+	for (unsigned char c; (c = *s++) != 0;)
+		h = (h * 33) + c;
+	return h;
+}
+
+static uint32_t u32_mod(uint32_t a, uint32_t m)
+{
+#ifdef ARM_IS_EVER_USED
+	if (m == 0)
+		return 0;
+	// shift-subtract reduction, no hardware/software div required
+	// used to avoid __aeabi_uidivmod on arm..
+	while (a >= m) {
+		uint32_t t = m;
+		/* grow t to the largest power-of-two multiple <= a */
+		while ((t << 1) > t && (t << 1) <= a)
+			t <<= 1;
+		a -= t;
+	}
+	return a;
+#else
+	if (m == 0) {
+		return 0;
+	}
+	return a % m;
+#endif
+}
+
+/* GNU hash lookup */
+static Elf_Sym *lookup_gnu(mod_t *restrict m, const char *restrict name)
+{
+	if (!m->gnu_buckets)
+		return NULL;
+	uint32_t h = gnu_hash_str(name);
+	size_t bloom_idx = (h / (sizeof(unsigned long) * 8)) & (m->gnu_maskwords - 1);
+	unsigned long bitmask = (1UL << (h % (sizeof(unsigned long) * 8))) |
+				(1UL << ((h >> m->gnu_shift2) % (sizeof(unsigned long) * 8)));
+	if ((m->gnu_bloom[bloom_idx] & bitmask) != bitmask)
+		return NULL;
+
+	uint32_t idx = m->gnu_buckets[u32_mod(h, m->gnu_nbucket)];
+	if (!idx)
+		return NULL;
+	for (;;) {
+		uint32_t hv = m->gnu_chain[idx - m->gnu_symoffset];
+		if ((hv | 1U) == (h | 1U)) {
+			Elf_Sym *sym = &m->dynsym[idx];
+			if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
+				return sym;
+		}
+		if (hv & 1U)
+			break;
+		idx++;
+	}
+	return NULL;
+}
+
+/* SysV hash lookup */
+static Elf_Sym *lookup_sysv(mod_t *restrict m, const char *restrict name)
+{
+	if (!m->buckets)
+		return NULL;
+	uint32_t h = sysv_hash(name);
+	for (uint32_t i = m->buckets[u32_mod(h, m->nbucket)]; i != 0; i = m->chains[i]) {
+		Elf_Sym *sym = &m->dynsym[i];
+		if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
+			return sym;
+	}
+	return NULL;
+}
+
+static void *resolve_sym(mod_t *restrict m, const char *restrict name)
+{
+	Elf_Sym *s = NULL;
+
+	if (!s) {
+		s = lookup_gnu(m, name);
+	}
+	if (!s) {
+		s = lookup_sysv(m, name);
+	}
+	if (RARELY(!s)) {
+		return NULL;
+	}
+	if (RARELY(ELF_ST_TYPE(s->st_info) != STT_FUNC && ELF_ST_TYPE(s->st_info) != STT_GNU_IFUNC)) {
+		return NULL;
+	}
+	return (void *)(m->base + s->st_value);
+}
 
 static void syscall1(unsigned long a1, unsigned long n, unn_syscall_result *res)
 {
@@ -96,15 +652,6 @@ static void syscall6(unsigned long a1, unsigned long a2, unsigned long a3, unsig
 #define SYS_MUNMAP 0x0b
 #define SYS_MMAP 0x09
 
-#define RARELY(x) (x)
-#define OFTEN(x) (x)
-#define ASSERT(x)                                                                                              \
-	do {                                                                                                   \
-		if (!(x)) {                                                                                    \
-			__builtin_unreachable();                                                               \
-		}                                                                                              \
-	} while (0)
-
 static void sys_exit(int status)
 {
 	/* too long assembly because of 'int' */
@@ -131,11 +678,6 @@ static long sys_mprotect(void *addr, size_t len, int prot)
 	ASSERT(rax.l == 0);
 	return rax.l;
 }
-
-#define LONG_MAX 0x7fffFFFFffffFFFF
-#define ULONG_MAX 0xffffFFFFffffFFFFu
-#define INT_MAX 0x7fffFFFF
-#define UINT_MAX 0xffffFFFF
 
 static long sys_mmap(void *restrict addr, unsigned long length, long prot, long flags, long fd, long offset,
 		     void **restrict result)
@@ -343,26 +885,6 @@ static long sys_openat(long dirfd, const void *restrict pathname, long flags, in
 	return rax.l;
 }
 
-__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char *argv[]);
-
-int main(int argc, char **argv)
-{
-	char *targv[2];
-	char *app;
-
-	if (argc > 1 && argv[1] != NULL && argv[1][0] != '\0') {
-		app = argv[1];
-	} else {
-		app = "/bin/sleep";
-	}
-
-	targv[0] = app;
-	targv[1] = "x";
-
-	exec_elf(app, sizeof targv / sizeof *targv, targv);
-	sys_exit(0);
-}
-
 static void *z_memset(void *s, int c, size_t n)
 {
 	unsigned char *p = s, *e = p + n;
@@ -405,345 +927,44 @@ static int z_strcmp(const char *a, const char *b)
 	return (unsigned char)*a - (unsigned char)*b;
 }
 
-#define PRIVATE __attribute__((visibility("hidden")))
+static long find_libc_base(void);
+static int mod_init(mod_t *m, unsigned long base);
 
-PRIVATE void z_trampo(void (*entry)(void), unsigned long *sp, void (*fini)(void));
-
-PRIVATE void z_fdl_entry(void);
-
-#define z_alloca __builtin_alloca
-
-#if !defined(ELFCLASS)
-#define ELFCLASS ELFCLASS64
-#endif
-
-#if ELFCLASS == ELFCLASS64
-#define Elf_Ehdr Elf64_Ehdr
-#define Elf_Phdr Elf64_Phdr
-#define Elf_Sym Elf64_Sym
-#define Elf_Dyn Elf64_Dyn
-#define Elf_auxv_t Elf64_auxv_t
-#elif ELFCLASS == ELFCLASS32
-#define Elf_Ehdr Elf32_Ehdr
-#define Elf_Phdr Elf32_Phdr
-#define Elf_Sym Elf32_Sym
-#define Elf_Dyn Elf32_Dyn
-#define Elf_auxv_t Elf32_auxv_t
-#else
-#error "ELFCLASS is not defined"
-#endif
-
-#define PAGE_SIZE 4096
-#define ALIGN (PAGE_SIZE - 1)
-#define ROUND_PG(x) (((x) + (ALIGN)) & ~(ALIGN))
-#define TRUNC_PG(x) ((x) & ~(ALIGN))
-#define PFLAGS(x)                                                                                              \
-	((((x) & PF_R) ? PROT_READ : 0) | (((x) & PF_W) ? PROT_WRITE : 0) | (((x) & PF_X) ? PROT_EXEC : 0))
-#define LOAD_ERR ((unsigned long)-1)
-
-/* Original sp (i.e. pointer to executable params) passed to entry, if any. */
-unsigned long *entry_sp;
-
-/* External fini function that the caller can provide us. */
-static void (*x_fini)(void);
-
-static void z_fini(void)
+static int fdl_resolve_from_maps(unsigned long interp_base)
 {
-	if (x_fini != NULL)
-		x_fini();
-}
-
-static int check_ehdr(Elf_Ehdr *ehdr)
-{
-	unsigned char *e_ident = ehdr->e_ident;
-	return (e_ident[EI_MAG0] != ELFMAG0 || e_ident[EI_MAG1] != ELFMAG1 || e_ident[EI_MAG2] != ELFMAG2 ||
-		e_ident[EI_MAG3] != ELFMAG3 || e_ident[EI_CLASS] != ELFCLASS ||
-		e_ident[EI_VERSION] != EV_CURRENT || (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN))
-		   ? 0
-		   : 1;
-}
-
-static unsigned long loadelf_anon(int fd, Elf_Ehdr *ehdr, Elf_Phdr *phdr)
-{
-	unsigned long minva, maxva;
-	Elf_Phdr *iter;
-	ssize_t sz;
-	int flags, dyn = ehdr->e_type == ET_DYN;
-	unsigned char *p, *base, *hint;
-	void *tmp;
-	long tmpres;
-
-	minva = (unsigned long)-1;
-	maxva = 0;
-
-	for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
-		if (iter->p_type != PT_LOAD)
-			continue;
-		if (iter->p_vaddr < minva)
-			minva = iter->p_vaddr;
-		if (iter->p_vaddr + iter->p_memsz > maxva)
-			maxva = iter->p_vaddr + iter->p_memsz;
+	if (0 > find_libc_base()) {
+		if (interp_base != 0) {
+			text_base = interp_base;
+		} else {
+			return -1;
+		}
 	}
 
-	minva = TRUNC_PG(minva);
-	maxva = ROUND_PG(maxva);
-
-	/* For dynamic ELF let the kernel chose the address. */
-	hint = dyn ? NULL : (void *)minva;
-	flags = dyn ? 0 : MAP_FIXED;
-	flags |= (MAP_PRIVATE | MAP_ANONYMOUS);
-
-	/* Check that we can hold the whole image. */
-	if (0 > sys_mmap(hint, maxva - minva, PROT_NONE, flags, -1, 0, &tmp)) {
+	mod_t M;
+	z_memset(&M, 0, sizeof M);
+	if (RARELY(mod_init(&M, text_base) < 0))
 		return -1;
-	}
-	base = tmp;
-	(void)sys_munmap(base, maxva - minva);
 
-	flags = MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE;
-	/* Now map each segment separately in precalculated address. */
-	for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
-		unsigned long off, start;
-		if (iter->p_type != PT_LOAD)
-			continue;
-		off = iter->p_vaddr & ALIGN;
-		start = dyn ? (unsigned long)base : 0;
-		start += TRUNC_PG(iter->p_vaddr);
-		sz = ROUND_PG(iter->p_memsz + off);
+	/* glibc: prefer __libc_dlopen_mode; fallback to dlopen/dlsym */
+	void *dlopen = resolve_sym(&M, "__libc_dlopen_mode");
+	if (!dlopen)
+		dlopen = resolve_sym(&M, "dlopen");
 
-		if (0 > sys_mmap((void *)start, sz, PROT_READ | PROT_WRITE, flags, -1, 0, &tmp)) {
-			goto err;
-		}
-		p = tmp;
+	void *dlsym = resolve_sym(&M, "dlsym");
 
-		if (0 > sys_lseek(fd, iter->p_offset, SEEK_SET, NULL)) {
-			goto err;
-		}
-
-		if (0 > sys_read(fd, p + off, iter->p_filesz, &tmpres) ||
-		    (unsigned long)tmpres != iter->p_filesz) {
-			goto err;
-		}
-
-		(void)sys_mprotect(p, sz, PFLAGS(iter->p_flags));
-	}
-
-	return (unsigned long)base;
-err:
-	(void)sys_munmap(base, maxva - minva);
-	return LOAD_ERR;
-}
-
-#define Z_PROG 0
-#define Z_INTERP 1
-
-void z_entry(unsigned long *sp, void (*fini)(void))
-{
-	int argc;
-	char **argv;
-
-	entry_sp = sp;
-	x_fini = fini;
-	argc = (int)*(sp);
-	argv = (char **)(sp + 1);
-	main(argc, argv);
-}
-
-__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char *argv[])
-{
-	Elf_Ehdr ehdrs[2], *ehdr = ehdrs;
-	Elf_Phdr *phdr, *iter;
-	Elf_auxv_t *av;
-	char **env, **p, *elf_interp = NULL;
-	unsigned long *sp = entry_sp;
-	unsigned long base[2], entry[2];
-	ssize_t sz;
-	int fd, i;
-	long tmpres;
-
-	{
-		unsigned long *p = sp;
-		/* argc */
-		p++;
-		/* argv */
-		while (*p++ != 0)
-			;
-
-		unsigned long *from = p;
-		/* env */
-		while (*p++ != 0)
-			;
-		/* aux vector */
-		while (*p++ != 0) {
-			p++;
-		}
-		p++;
-
-		unsigned long argv_sz = argc * sizeof(*p);
-		unsigned sz = (char *)p - (char *)from;
-		p = alloca(sizeof(*p) + argv_sz + sz);
-		*p = argc;
-		z_memcpy(p + 1, argv, argv_sz);
-		z_memcpy((char *)(p + 1) + argv_sz, from, sz);
-		sp = p;
-		argv = (char **)sp + 1;
-	}
-
-	env = p = (char **)&argv[argc + 1];
-	while (*p++ != NULL)
-		;
-	av = (void *)p;
-
-	(void)env;
-
-	for (i = 0;; i++, ehdr++) {
-		/* Open file, read and than check ELF header.*/
-		if (0 > sys_openat(AT_FDCWD, file, O_RDONLY, &fd)) {
-			sys_exit(1);
-		}
-
-		if (0 > sys_read(fd, ehdr, sizeof *ehdr, &tmpres) || tmpres != sizeof *ehdr) {
-			sys_exit(1);
-		}
-
-		if (!check_ehdr(ehdr))
-			sys_exit(1);
-
-		/* Read the program header. */
-		sz = ehdr->e_phnum * sizeof(Elf_Phdr);
-		phdr = z_alloca(sz);
-
-		if (0 > sys_lseek(fd, ehdr->e_phoff, SEEK_SET, NULL)) {
-			sys_exit(1);
-		}
-
-		if (0 > sys_read(fd, phdr, sz, &tmpres) || tmpres != sz) {
-			sys_exit(1);
-		}
-
-		/* Time to load ELF. */
-		if ((base[i] = loadelf_anon(fd, ehdr, phdr)) == LOAD_ERR)
-			sys_exit(1);
-
-		/* Set the entry point, if the file is dynamic than add bias. */
-		entry[i] = ehdr->e_entry + (ehdr->e_type == ET_DYN ? base[i] : 0);
-		/* The second round, we've loaded ELF interp. */
-		if (file == elf_interp)
-			break;
-		for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
-			if (iter->p_type != PT_INTERP)
-				continue;
-			elf_interp = z_alloca(iter->p_filesz);
-
-			if (0 > sys_lseek(fd, iter->p_offset, SEEK_SET, NULL)) {
-				sys_exit(1);
-			}
-
-			if (0 > sys_read(fd, elf_interp, iter->p_filesz, &tmpres) ||
-			    tmpres != (ssize_t)iter->p_filesz) {
-				sys_exit(1);
-			}
-
-			if (elf_interp[iter->p_filesz - 1] != '\0')
-				sys_exit(1);
-			// z_printf("elf_interp: %s\n", elf_interp);
-			file = elf_interp;
-		}
-		/* Looks like the ELF is static -- leave the loop. */
-		if (elf_interp == NULL)
-			break;
-	}
-
-	/* Reassign some vectors that are important for
-	 * the dynamic linker and for lib C. */
-#define AVSET(t, v, expr)                                                                                      \
-	case (t):                                                                                              \
-		(v)->a_un.a_val = (expr);                                                                      \
-		break
-	while (av->a_type != AT_NULL) {
-		switch (av->a_type) {
-			AVSET(AT_PHDR, av, base[Z_PROG] + ehdrs[Z_PROG].e_phoff);
-			AVSET(AT_PHNUM, av, ehdrs[Z_PROG].e_phnum);
-			AVSET(AT_PHENT, av, ehdrs[Z_PROG].e_phentsize);
-			// AVSET(AT_ENTRY, av, entry[Z_PROG]);
-			// We override the entrypoint with our own, thereby maintaining execution control
-			AVSET(AT_ENTRY, av, (unsigned long)z_fdl_entry);
-			AVSET(AT_EXECFN, av, (unsigned long)argv[1]);
-			AVSET(AT_BASE, av, elf_interp ? base[Z_INTERP] : av->a_un.a_val);
-		}
-		++av;
-	}
-#undef AVSET
-	++av;
-
-	if (elf_interp) {
-		g_interp_base = base[Z_INTERP];
-	}
-
-	z_trampo((void (*)(void))(elf_interp ? entry[Z_INTERP] : entry[Z_PROG]), sp, z_fini);
-	/* Should not reach. */
-	sys_exit(0);
-}
-
-#ifndef ELF_ST_TYPE
-#define ELF_ST_TYPE(i) ((i) & 0xF)
-#endif
-
-#ifndef MAPS_PATH
-#define MAPS_PATH "/proc/self/maps"
-#endif
-
-static unsigned long text_base;
-static const char *soname;
-
-static void *fdl_dlopen_sym(void *p)
-{
-	static void *g_fdl_dlopen = NULL;
-	if (p)
-		g_fdl_dlopen = p;
-	return g_fdl_dlopen;
-}
-
-static void *fdl_dlsym_sym(void *p)
-{
-	static void *g_fdl_dlsym = NULL;
-	if (p)
-		g_fdl_dlsym = p;
-	return g_fdl_dlsym;
-}
-
-/* helper: turn a DT_* pointer/offset into an absolute VA */
-static inline void *dyn_ptr(unsigned long base, unsigned long lo, unsigned long hi, unsigned long p)
-{
-	unsigned long v = p;
-	/* if it's not already inside this module's mapped range, treat as offset */
-	if (v < lo || v >= hi)
-		v += base;
-	return (void *)v;
-}
-
-static inline uint32_t u32_mod(uint32_t a, uint32_t m)
-{
-	if (m == 0)
-		return 0;
-	// shift-subtract reduction, no hardware/software div required
-	// used to avoid __aeabi_uidivmod on arm..
-	while (a >= m) {
-		uint32_t t = m;
-		/* grow t to the largest power-of-two multiple ≤ a */
-		while ((t << 1) > t && (t << 1) <= a)
-			t <<= 1;
-		a -= t;
-	}
-	return a;
+	fdl_dlopen_sym(dlopen);
+	fdl_dlsym_sym(dlsym);
+	return dlopen && dlsym ? 0 : -1;
 }
 
 /* Minimal readers */
 static int read_all(int fd, char *buf, int sz)
 {
-	int off = 0, n;
+	int off;
+	int n;
 	long tmpres;
 
+	off = 0;
 	while (1) {
 		if (off >= sz) {
 			break;
@@ -764,80 +985,20 @@ static int read_all(int fd, char *buf, int sz)
 	return off;
 }
 
-/* parse one /proc/self/maps line; returns 0 on success */
-static int parse_maps_line(const char *line, unsigned long *start, char perms_out[5], unsigned long *offset,
-			   const char **path_out)
-{
-	const char *p = line;
-	unsigned long v = 0;
-	int i;
-
-	/* start */
-	v = 0;
-	for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'); p++)
-		v = (v << 4) |
-		    (unsigned long)((*p <= '9') ? *p - '0' : (*p >= 'a' ? 10 + *p - 'a' : 10 + *p - 'A'));
-	if (*p != '-')
-		return -1;
-	*start = v;
-	p++;
-
-	/* end (skip) */
-	for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'); p++)
-		;
-	while (*p == ' ')
-		p++;
-
-	/* perms (4 chars) */
-	for (i = 0; i < 4; i++) {
-		if (!p[i])
-			return -1;
-		perms_out[i] = p[i];
-	}
-	perms_out[4] = 0;
-	p += 4;
-	while (*p == ' ')
-		p++;
-
-	/* offset */
-	v = 0;
-	for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'); p++)
-		v = (v << 4) |
-		    (unsigned long)((*p <= '9') ? *p - '0' : (*p >= 'a' ? 10 + *p - 'a' : 10 + *p - 'A'));
-	*offset = v;
-
-	/* skip dev */
-	while (*p && *p != ' ')
-		p++;
-	while (*p == ' ')
-		p++;
-	/* skip inode */
-	while (*p && *p != ' ')
-		p++;
-	while (*p == ' ')
-		p++;
-
-	/* path (may be empty) */
-	*path_out = (*p) ? p : NULL;
-	return 0;
-}
-
 /* Parse /proc/self/maps to find libc mapping with offset 0 */
-static int find_libc_base(void)
+static long find_libc_base(void)
 {
-	static int cached = 0;
-	static unsigned long cached_base = 0;
-	static const char *cached_name = NULL;
+	long res;
 
-	if (cached) {
-		text_base = cached_base;
-		soname = cached_name;
+	if (gl_cached) {
+		text_base = gl_cached_base;
+		soname = gl_cached_name;
 		return 0;
 	}
 
 	int fd;
-	if (0 > sys_openat(AT_FDCWD, MAPS_PATH, O_RDONLY, &fd)) {
-		return -1;
+	if (0 > (res = sys_openat(AT_FDCWD, MAPS_PATH, O_RDONLY, &fd))) {
+		return res;
 	}
 
 	char buf[65536];
@@ -861,9 +1022,9 @@ static int find_libc_base(void)
 			if (parse_maps_line(line, &start, perms, &off, &path) == 0 && path && off == 0) {
 				text_base = start;
 				soname = path;
-				cached = 1;
-				cached_base = text_base;
-				cached_name = soname;
+				gl_cached = 1;
+				gl_cached_base = text_base;
+				gl_cached_name = soname;
 				*p = save;
 				return 0;
 			}
@@ -876,32 +1037,24 @@ static int find_libc_base(void)
 	return -1;
 }
 
-/* In-memory ELF helpers */
-typedef struct {
-	Elf_Ehdr *eh;
-	Elf_Phdr *ph;
-	Elf_Dyn *dyn;
-	unsigned long base;
-	unsigned long nbucket, nchain;
-	uint32_t *buckets, *chains;
-	uint32_t *gnu_buckets;
-	uint32_t *gnu_chain;
-	uint32_t gnu_maskwords;
-	uint32_t gnu_shift2;
-	unsigned long *gnu_bloom;
-	uint32_t gnu_nbucket;
-	uint32_t gnu_symoffset;
-	Elf_Sym *dynsym;
-	const char *dynstr;
-	uint16_t *versym;
-} mod_t;
+/* helper: turn a DT_* pointer/offset into an absolute VA */
+static void *dyn_ptr(unsigned long base, unsigned long lo, unsigned long hi, unsigned long p)
+{
+	unn_syscall_result vp;
+
+	vp.ul = p;
+	/* if it's not already inside this module's mapped range, treat as offset */
+	if (vp.ul < lo || vp.ul >= hi)
+		vp.ul += base;
+	return vp.p;
+}
 
 static int mod_init(mod_t *m, unsigned long base)
 {
 	m->base = base;
 	m->eh = (Elf_Ehdr *)base;
-	if (m->eh->e_ident[0] != 0x7f || m->eh->e_ident[1] != 'E' || m->eh->e_ident[2] != 'L' ||
-	    m->eh->e_ident[3] != 'F')
+	if (RARELY(m->eh->e_ident[0] != 0x7f || m->eh->e_ident[1] != 'E' || m->eh->e_ident[2] != 'L' ||
+		   m->eh->e_ident[3] != 'F'))
 		return -1;
 
 	m->ph = (Elf_Phdr *)(base + m->eh->e_phoff);
@@ -930,7 +1083,7 @@ static int mod_init(mod_t *m, unsigned long base)
 			break;
 		}
 	}
-	if (!m->dyn) {
+	if (RARELY(!m->dyn)) {
 		return -1;
 	}
 
@@ -946,8 +1099,8 @@ static int mod_init(mod_t *m, unsigned long base)
 			uint32_t *h = (uint32_t *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
 			m->nbucket = h[0];
 			m->nchain = h[1];
-			m->buckets = &h[2];
-			m->chains = &h[2 + m->nbucket];
+			m->buckets = h + 2;
+			m->chains = h + 2 + m->nbucket;
 			break;
 		}
 		case DT_GNU_HASH: {
@@ -969,115 +1122,20 @@ static int mod_init(mod_t *m, unsigned long base)
 		}
 	}
 
-	return (m->dynsym && m->dynstr) ? 0 : -1;
+	return m->dynsym && m->dynstr ? 0 : -1;
 }
 
-static uint32_t sysv_hash(const char *s)
+static void *fdl_dlopen_sym(void *p)
 {
-	uint32_t h = 0, g;
-	while (*s) {
-		h = (h << 4) + (unsigned char)*s++;
-		g = h & 0xF0000000U;
-		if (g)
-			h ^= g >> 24;
-		h &= ~g;
-	}
-	return h;
+	if (p)
+		gl_g_fdl_dlopen = p;
+	return gl_g_fdl_dlopen;
 }
 
-static uint32_t gnu_hash_str(const char *s)
+static void *fdl_dlsym_sym(void *p)
 {
-	uint32_t h = 5381;
-	for (unsigned char c; (c = *s++) != 0;)
-		h = (h * 33) + c;
-	return h;
+	if (p)
+		gl_g_fdl_dlsym = p;
+	return gl_g_fdl_dlsym;
 }
 
-/* GNU hash lookup */
-static Elf_Sym *lookup_gnu(mod_t *m, const char *name)
-{
-	if (!m->gnu_buckets)
-		return NULL;
-	uint32_t h = gnu_hash_str(name);
-	size_t bloom_idx = (h / (sizeof(unsigned long) * 8)) & (m->gnu_maskwords - 1);
-	unsigned long bitmask = (1UL << (h % (sizeof(unsigned long) * 8))) |
-				(1UL << ((h >> m->gnu_shift2) % (sizeof(unsigned long) * 8)));
-	if ((m->gnu_bloom[bloom_idx] & bitmask) != bitmask)
-		return NULL;
-
-	uint32_t idx = m->gnu_buckets[u32_mod(h, m->gnu_nbucket)];
-	if (!idx)
-		return NULL;
-	for (;;) {
-		uint32_t hv = m->gnu_chain[idx - m->gnu_symoffset];
-		if ((hv | 1U) == (h | 1U)) {
-			Elf_Sym *sym = &m->dynsym[idx];
-			if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
-				return sym;
-		}
-		if (hv & 1U)
-			break;
-		idx++;
-	}
-	return NULL;
-}
-
-/* SysV hash lookup */
-static Elf_Sym *lookup_sysv(mod_t *m, const char *name)
-{
-	if (!m->buckets)
-		return NULL;
-	uint32_t h = sysv_hash(name);
-	for (uint32_t i = m->buckets[u32_mod(h, m->nbucket)]; i != 0; i = m->chains[i]) {
-		Elf_Sym *sym = &m->dynsym[i];
-		if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
-			return sym;
-	}
-	return NULL;
-}
-
-static void *resolve_sym(mod_t *m, const char *name)
-{
-	Elf_Sym *s = NULL;
-
-	if (!s) {
-		s = lookup_gnu(m, name);
-	}
-	if (!s) {
-		s = lookup_sysv(m, name);
-	}
-	if (!s) {
-		return NULL;
-	}
-	if (ELF_ST_TYPE(s->st_info) != STT_FUNC && ELF_ST_TYPE(s->st_info) != STT_GNU_IFUNC) {
-		return NULL;
-	}
-	return (void *)(m->base + s->st_value);
-}
-
-static int fdl_resolve_from_maps(unsigned long interp_base)
-{
-	if (find_libc_base() < 0) {
-		if (interp_base) {
-			text_base = interp_base;
-		} else {
-			return -1;
-		}
-	}
-
-	mod_t M;
-	z_memset(&M, 0, sizeof(M));
-	if (mod_init(&M, text_base) < 0)
-		return -1;
-
-	/* glibc: prefer __libc_dlopen_mode; fallback to dlopen/dlsym */
-	void *dlopen = resolve_sym(&M, "__libc_dlopen_mode");
-	if (!dlopen)
-		dlopen = resolve_sym(&M, "dlopen");
-
-	void *dlsym = resolve_sym(&M, "dlsym");
-
-	fdl_dlopen_sym(dlopen);
-	fdl_dlsym_sym(dlsym);
-	return (dlopen && dlsym) ? 0 : -1;
-}
