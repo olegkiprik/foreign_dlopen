@@ -2,17 +2,17 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/mman.h>
-#include <syscall.h>
 
-static void z_exit(int status);
 static int fdl_resolve_from_maps(unsigned long interp_base);
 static void *fdl_dlopen_sym(void *p);
 static void *fdl_dlsym_sym(void *p);
 static unsigned long g_interp_base = 0;
 
-#ifndef RTLD_NOW
+#if !defined(RTLD_NOW)
 #define RTLD_NOW 0x0002
 #endif
+
+static void sys_exit(int status);
 
 // MUST ensure that stack is 16 byte aligned for calls to external functions
 // especially ones with variadic arguments. We do this via the z_fdlentry.S wrapper
@@ -34,40 +34,333 @@ void fdl_entry_impl(void)
 
 		m = (*my_dlopen)("libm.so.6", RTLD_NOW);
 		if (m == NULL) {
-			z_exit(1);
+			sys_exit(1);
 		}
 
 		my_sinf = (*my_dlsym)(m, "sinf");
 		if (my_sinf == NULL) {
-			z_exit(1);
+			sys_exit(1);
 		}
 
 		if (libc_printf != NULL)
-			(*libc_printf)("sine of 3.14/2 is %f\n", (*my_sinf)(3.14/2));
+			(*libc_printf)("sine of 3.14/3 is %f\n", (*my_sinf)(3.14 / 3));
 	}
-	z_exit(0);
+	sys_exit(0);
+}
+
+typedef union unn_syscall_result_ {
+	long l;
+	unsigned long ul;
+	void *p;
+} unn_syscall_result;
+
+static void syscall1(unsigned long a1, unsigned long n, unn_syscall_result *res)
+{
+	asm volatile("syscall" : "=a"(*res) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
+}
+
+static void syscall2(unsigned long a1, unsigned long a2, unsigned long n, unn_syscall_result *res)
+{
+	asm volatile("syscall" : "=a"(*res) : "a"(n), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
+}
+
+static void syscall3(unsigned long a1, unsigned long a2, unsigned long a3, unsigned long n,
+		     unn_syscall_result *res)
+{
+	asm volatile("syscall" : "=a"(*res) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
+}
+
+static void syscall6(unsigned long a1, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5,
+		     unsigned long a6, unsigned long n, unn_syscall_result *res)
+{
+	register unsigned long r10 asm("r10") = a4;
+	register unsigned long r8 asm("r8") = a5;
+	register unsigned long r9 asm("r9") = a6;
+	asm volatile("syscall"
+		     : "=a"(*res)
+		     : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+		     : "rcx", "r11", "memory");
+}
+
+#define SYS_EXIT 0x3c
+#define SYS_WRITE 0x01
+#define SYS_READ 0x00
+#define SYS_OPENAT 0x101
+#define SYS_CLOSE 0x03
+#define SYS_LSEEK 0x08
+#define SYS_SYNC 0xa2
+#define SYS_MSYNC 0x1a
+#define SYS_FSYNC 0x4a
+#define SYS_FDATASYNC 0x4b
+#define SYS_MPROTECT 0xa
+#define SYS_MUNMAP 0x0b
+#define SYS_MMAP 0x09
+
+#define RARELY(x) (x)
+#define OFTEN(x) (x)
+#define ASSERT(x)                                                                                              \
+	do {                                                                                                   \
+		if (!(x)) {                                                                                    \
+			__builtin_unreachable();                                                               \
+		}                                                                                              \
+	} while (0)
+
+static void sys_exit(int status)
+{
+	/* too long assembly because of 'int' */
+	unn_syscall_result rax;
+	syscall1((long)status, SYS_EXIT, &rax);
+	(void)rax;
+}
+
+static long sys_mprotect(void *addr, size_t len, int prot)
+{
+	unn_syscall_result rax;
+
+	syscall3((unsigned long)addr, len, (unsigned long)prot, SYS_MPROTECT, &rax);
+	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
+		return rax.l;
+	}
+
+#if defined(KERNEL_MITIGATION_ERRNO)
+	if (RARELY(rax != 0)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#endif
+
+	ASSERT(rax.l == 0);
+	return rax.l;
+}
+
+#define LONG_MAX 0x7fffFFFFffffFFFF
+#define ULONG_MAX 0xffffFFFFffffFFFFu
+#define INT_MAX 0x7fffFFFF
+#define UINT_MAX 0xffffFFFF
+
+static long sys_mmap(void *restrict addr, unsigned long length, long prot, long flags, long fd, long offset,
+		     void **restrict result)
+{
+	unn_syscall_result rax;
+	unsigned long offset_ul;
+	unsigned long fd_ul;
+
+	ASSERT(prot >= 0);
+	ASSERT(flags >= 0);
+	ASSERT(fd >= 0 || fd == -1);
+	ASSERT(prot <= INT_MAX);
+	ASSERT(flags <= INT_MAX);
+	ASSERT(fd <= INT_MAX);
+
+	if (offset < 0) {
+		offset -= -LONG_MAX - 1;
+		offset_ul = (unsigned long)offset;
+		offset_ul -= -LONG_MAX - 1;
+	} else {
+		offset_ul = (unsigned long)offset;
+	}
+
+	if (fd == -1) {
+		fd_ul = ULONG_MAX;
+	} else {
+		fd_ul = (unsigned long)fd;
+	}
+
+	/* 'offset' is changed */
+
+	syscall6((unsigned long)addr, length, (unsigned long)(long)prot, (unsigned long)(long)flags, fd_ul,
+		 offset_ul, SYS_MMAP, &rax);
+	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
+		return rax.l;
+	}
+
+#if defined(KERNEL_MITIGATION_ERRNO)
+	if (RARELY(rax.l < 0)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#endif
+
+	ASSERT(rax.l >= 0);
+
+	if (OFTEN(result != NULL)) {
+		*result = rax.p;
+	}
+
+	return rax.l;
+}
+
+static long sys_munmap(void *addr, unsigned long length)
+{
+	unn_syscall_result rax;
+
+	syscall2((unsigned long)addr, length, SYS_MUNMAP, &rax);
+	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
+		return rax.l;
+	}
+
+#if defined(KERNEL_MITIGATION_ERRNO)
+	if (RARELY(rax != 0)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#endif
+
+	ASSERT(rax.l == 0);
+	return rax.l;
+}
+
+static long sys_lseek(long fd, long offset, long whence, long *result)
+{
+	unn_syscall_result rax;
+
+	ASSERT(fd >= 0);
+	ASSERT(whence >= 0);
+	ASSERT(fd <= INT_MAX);
+	ASSERT(whence <= INT_MAX);
+
+	syscall3((unsigned long)fd, (unsigned long)offset, (unsigned long)whence, SYS_LSEEK, &rax);
+	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
+		return rax.l;
+	}
+
+#if defined(KERNEL_MITIGATION_ERRNO)
+	if (RARELY(rax <= -0x1000)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#endif
+
+	ASSERT(rax.l >= 0);
+	if (OFTEN(result != NULL)) {
+		*result = rax.l;
+	}
+	return rax.l;
+}
+
+static long sys_read(long fd, void *restrict buf, unsigned long nbytes, long *restrict result)
+{
+	unn_syscall_result rax;
+
+	ASSERT(buf != NULL);
+	ASSERT(fd >= 0);
+	ASSERT(fd <= INT_MAX);
+
+#if defined(STDIO_DESCRIPTOR_NO_HACKING)
+	ASSERT(fd != STDOUT_FILENO);
+	ASSERT(fd != STDERR_FILENO);
+#endif
+
+	syscall3((unsigned long)(long)fd, (unsigned long)buf, nbytes, SYS_READ, &rax);
+	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
+		return rax.l;
+	}
+
+#if defined(KERNEL_MITIGATION_ERRNO)
+	if (RARELY(rax < 0 || (unsigned long)rax > nbytes)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#endif
+
+	ASSERT(rax.l >= 0);
+	ASSERT((unsigned long)rax.l <= nbytes);
+
+	if (OFTEN(result != NULL)) {
+		*result = rax.l;
+	}
+	return rax.l;
+}
+
+static long sys_close(long fd)
+{
+	unn_syscall_result rax;
+
+	ASSERT(fd >= 0);
+	ASSERT(fd <= INT_MAX);
+#if defined(STDIO_DESCRIPTOR_NO_HACKING)
+	ASSERT(fd != STDIN_FILENO);
+	ASSERT(fd != STDOUT_FILENO);
+	ASSERT(fd != STDERR_FILENO);
+#endif
+
+	syscall1((unsigned long)(long)fd, SYS_CLOSE, &rax);
+	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
+		return rax.l;
+	}
+
+#if defined(KERNEL_MITIGATION_ERRNO)
+	if (RARELY(rax.l != 0)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#endif
+
+	ASSERT(rax.l == 0);
+	return rax.l;
+}
+
+static long sys_openat(long dirfd, const void *restrict pathname, long flags, int *restrict result)
+{
+	unn_syscall_result rax;
+	unsigned long dirfd_ul;
+
+	ASSERT(result != NULL);
+	ASSERT(flags >= 0);
+	ASSERT(dirfd == AT_FDCWD || dirfd >= 0);
+	ASSERT(AT_FDCWD >= -LONG_MAX);
+	ASSERT(AT_FDCWD < 0);
+	ASSERT(dirfd <= INT_MAX);
+	ASSERT(flags <= INT_MAX);
+
+	if (dirfd == AT_FDCWD) {
+		dirfd_ul = ULONG_MAX - (-AT_FDCWD) + 1;
+	} else {
+		dirfd_ul = (unsigned long)dirfd;
+	}
+
+	syscall3(dirfd_ul, (unsigned long)pathname, (unsigned long)(long)flags, SYS_OPENAT, &rax);
+	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
+		return rax.l;
+	}
+
+#if defined(KERNEL_MITIGATION_ERRNO)
+	if (RARELY(rax > INT_MAX || rax <= -0x1000)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#if defined(STDIO_DESCRIPTOR_NO_HACKING)
+	if (LESS_LIKELY(rax == STDOUT_FILENO || rax == STDERR_FILENO || rax == STDIN_FILENO)) {
+		return -KERNEL_MITIGATION_ERRNO;
+	}
+#endif
+#endif /* KERNEL_MITIGATION_ERRNO */
+
+	ASSERT(rax.l <= INT_MAX);
+	ASSERT(rax.l > -0x1000);
+#if defined(STDIO_DESCRIPTOR_NO_HACKING)
+	ASSERT(rax.l != STDOUT_FILENO);
+	ASSERT(rax.l != STDERR_FILENO);
+	ASSERT(rax.l != STDIN_FILENO);
+#endif
+
+	if (OFTEN(result != NULL)) {
+		*result = (int)rax.l;
+	}
+	return rax.l;
 }
 
 __attribute__((always_inline)) static void exec_elf(const char *file, int argc, char *argv[]);
 
-#define DL_APP_DEFAULT "/bin/sleep"
-
-int main(int argc, char *argv[])
+int main(int argc, char **argv)
 {
-	(void)argc;
-	(void)argv;
+	char *targv[2];
+	char *app;
 
-	const char *app;
-	if (argc > 1 && argv[1] && argv[1][0]) {
+	if (argc > 1 && argv[1] != NULL && argv[1][0] != '\0') {
 		app = argv[1];
 	} else {
-		app = DL_APP_DEFAULT;
+		app = "/bin/sleep";
 	}
 
-	char *targv[] = {(char *)app, (char *)"x"};
-	exec_elf(app, 2, targv);
+	targv[0] = app;
+	targv[1] = "x";
 
-	z_exit(0);
+	exec_elf(app, sizeof targv / sizeof *targv, targv);
+	sys_exit(0);
 }
 
 static void *z_memset(void *s, int c, size_t n)
@@ -113,57 +406,6 @@ static int z_strcmp(const char *a, const char *b)
 }
 
 #define PRIVATE __attribute__((visibility("hidden")))
-
-PRIVATE long z_syscall(int n, ...);
-
-static int errno;
-
-static long check_error(long rc)
-{
-	if (rc < 0 && rc > -4096) {
-		errno = -rc;
-		rc = -1;
-	}
-	return rc;
-}
-
-#define SYSCALL(name, ...) check_error(z_syscall(SYS_##name, __VA_ARGS__))
-#define DEF_SYSCALL1(ret, name, t1, a1)                                                                        \
-	static ret z_##name(t1 a1)                                                                             \
-	{                                                                                                      \
-		return (ret)SYSCALL(name, a1);                                                                 \
-	}
-#define DEF_SYSCALL2(ret, name, t1, a1, t2, a2)                                                                \
-	static ret z_##name(t1 a1, t2 a2)                                                                      \
-	{                                                                                                      \
-		return (ret)SYSCALL(name, a1, a2);                                                             \
-	}
-#define DEF_SYSCALL3(ret, name, t1, a1, t2, a2, t3, a3)                                                        \
-	static ret z_##name(t1 a1, t2 a2, t3 a3)                                                               \
-	{                                                                                                      \
-		return (ret)SYSCALL(name, a1, a2, a3);                                                         \
-	}
-
-DEF_SYSCALL1(void, exit, int, status)
-DEF_SYSCALL2(int, open, const char *, filename, int, flags)
-DEF_SYSCALL3(ssize_t, read, int, fd, void *, buf, size_t, count)
-DEF_SYSCALL1(int, close, int, fd)
-DEF_SYSCALL3(int, lseek, int, fd, off_t, off, int, whence)
-DEF_SYSCALL2(int, munmap, void *, addr, size_t, length)
-DEF_SYSCALL3(int, mprotect, void *, addr, size_t, length, int, prot)
-
-static void *z_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
-{
-	/* i386 has map (old_mmap) and mmap2, old_map is a legacy single arg
-	 * function, use mmap2 but it needs offset in page units.
-	 * In same time mmap2 does not exist on x86-64.
-	 */
-#ifdef SYS_mmap2
-	return (void *)SYSCALL(mmap2, addr, length, prot, flags, fd, offset >> 12);
-#else
-	return (void *)SYSCALL(mmap, addr, length, prot, flags, fd, offset);
-#endif
-}
 
 PRIVATE void z_trampo(void (*entry)(void), unsigned long *sp, void (*fini)(void));
 
@@ -228,6 +470,8 @@ static unsigned long loadelf_anon(int fd, Elf_Ehdr *ehdr, Elf_Phdr *phdr)
 	ssize_t sz;
 	int flags, dyn = ehdr->e_type == ET_DYN;
 	unsigned char *p, *base, *hint;
+	void *tmp;
+	long tmpres;
 
 	minva = (unsigned long)-1;
 	maxva = 0;
@@ -250,10 +494,11 @@ static unsigned long loadelf_anon(int fd, Elf_Ehdr *ehdr, Elf_Phdr *phdr)
 	flags |= (MAP_PRIVATE | MAP_ANONYMOUS);
 
 	/* Check that we can hold the whole image. */
-	base = z_mmap(hint, maxva - minva, PROT_NONE, flags, -1, 0);
-	if (base == (void *)-1)
+	if (0 > sys_mmap(hint, maxva - minva, PROT_NONE, flags, -1, 0, &tmp)) {
 		return -1;
-	z_munmap(base, maxva - minva);
+	}
+	base = tmp;
+	(void)sys_munmap(base, maxva - minva);
 
 	flags = MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE;
 	/* Now map each segment separately in precalculated address. */
@@ -266,22 +511,26 @@ static unsigned long loadelf_anon(int fd, Elf_Ehdr *ehdr, Elf_Phdr *phdr)
 		start += TRUNC_PG(iter->p_vaddr);
 		sz = ROUND_PG(iter->p_memsz + off);
 
-		p = z_mmap((void *)start, sz, PROT_READ | PROT_WRITE, flags, -1, 0);
-		if (p == (void *)-1) {
+		if (0 > sys_mmap((void *)start, sz, PROT_READ | PROT_WRITE, flags, -1, 0, &tmp)) {
 			goto err;
 		}
-		if (z_lseek(fd, iter->p_offset, SEEK_SET) < 0) {
+		p = tmp;
+
+		if (0 > sys_lseek(fd, iter->p_offset, SEEK_SET, NULL)) {
 			goto err;
 		}
-		if (z_read(fd, p + off, iter->p_filesz) != (ssize_t)iter->p_filesz) {
+
+		if (0 > sys_read(fd, p + off, iter->p_filesz, &tmpres) ||
+		    (unsigned long)tmpres != iter->p_filesz) {
 			goto err;
 		}
-		z_mprotect(p, sz, PFLAGS(iter->p_flags));
+
+		(void)sys_mprotect(p, sz, PFLAGS(iter->p_flags));
 	}
 
 	return (unsigned long)base;
 err:
-	z_munmap(base, maxva - minva);
+	(void)sys_munmap(base, maxva - minva);
 	return LOAD_ERR;
 }
 
@@ -310,6 +559,7 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 	unsigned long base[2], entry[2];
 	ssize_t sz;
 	int fd, i;
+	long tmpres;
 
 	{
 		unsigned long *p = sp;
@@ -348,23 +598,32 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 
 	for (i = 0;; i++, ehdr++) {
 		/* Open file, read and than check ELF header.*/
-		if ((fd = z_open(file, O_RDONLY)) < 0)
-			z_exit(1);
-		if (z_read(fd, ehdr, sizeof(*ehdr)) != sizeof(*ehdr))
-			z_exit(1);
+		if (0 > sys_openat(AT_FDCWD, file, O_RDONLY, &fd)) {
+			sys_exit(1);
+		}
+
+		if (0 > sys_read(fd, ehdr, sizeof *ehdr, &tmpres) || tmpres != sizeof *ehdr) {
+			sys_exit(1);
+		}
+
 		if (!check_ehdr(ehdr))
-			z_exit(1);
+			sys_exit(1);
 
 		/* Read the program header. */
 		sz = ehdr->e_phnum * sizeof(Elf_Phdr);
 		phdr = z_alloca(sz);
-		if (z_lseek(fd, ehdr->e_phoff, SEEK_SET) < 0)
-			z_exit(1);
-		if (z_read(fd, phdr, sz) != sz)
-			z_exit(1);
+
+		if (0 > sys_lseek(fd, ehdr->e_phoff, SEEK_SET, NULL)) {
+			sys_exit(1);
+		}
+
+		if (0 > sys_read(fd, phdr, sz, &tmpres) || tmpres != sz) {
+			sys_exit(1);
+		}
+
 		/* Time to load ELF. */
 		if ((base[i] = loadelf_anon(fd, ehdr, phdr)) == LOAD_ERR)
-			z_exit(1);
+			sys_exit(1);
 
 		/* Set the entry point, if the file is dynamic than add bias. */
 		entry[i] = ehdr->e_entry + (ehdr->e_type == ET_DYN ? base[i] : 0);
@@ -375,12 +634,18 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 			if (iter->p_type != PT_INTERP)
 				continue;
 			elf_interp = z_alloca(iter->p_filesz);
-			if (z_lseek(fd, iter->p_offset, SEEK_SET) < 0)
-				z_exit(1);
-			if (z_read(fd, elf_interp, iter->p_filesz) != (ssize_t)iter->p_filesz)
-				z_exit(1);
+
+			if (0 > sys_lseek(fd, iter->p_offset, SEEK_SET, NULL)) {
+				sys_exit(1);
+			}
+
+			if (0 > sys_read(fd, elf_interp, iter->p_filesz, &tmpres) ||
+			    tmpres != (ssize_t)iter->p_filesz) {
+				sys_exit(1);
+			}
+
 			if (elf_interp[iter->p_filesz - 1] != '\0')
-				z_exit(1);
+				sys_exit(1);
 			// z_printf("elf_interp: %s\n", elf_interp);
 			file = elf_interp;
 		}
@@ -417,7 +682,7 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 
 	z_trampo((void (*)(void))(elf_interp ? entry[Z_INTERP] : entry[Z_PROG]), sp, z_fini);
 	/* Should not reach. */
-	z_exit(0);
+	sys_exit(0);
 }
 
 #ifndef ELF_ST_TYPE
@@ -477,8 +742,25 @@ static inline uint32_t u32_mod(uint32_t a, uint32_t m)
 static int read_all(int fd, char *buf, int sz)
 {
 	int off = 0, n;
-	while (off < sz && (n = z_read(fd, buf + off, sz - off)) > 0)
+	long tmpres;
+
+	while (1) {
+		if (off >= sz) {
+			break;
+		}
+
+		if (0 > sys_read(fd, buf + off, sz - off, &tmpres)) {
+			break;
+		}
+
+		if (tmpres <= 0) {
+			break;
+		}
+
+		n = tmpres;
 		off += n;
+	}
+
 	return off;
 }
 
@@ -553,13 +835,14 @@ static int find_libc_base(void)
 		return 0;
 	}
 
-	int fd = z_open(MAPS_PATH, O_RDONLY);
-	if (fd < 0)
+	int fd;
+	if (0 > sys_openat(AT_FDCWD, MAPS_PATH, O_RDONLY, &fd)) {
 		return -1;
+	}
 
 	char buf[65536];
 	int n = read_all(fd, buf, sizeof(buf) - 1);
-	z_close(fd);
+	(void)sys_close(fd);
 	if (n <= 0)
 		return -1;
 	buf[n] = 0;
