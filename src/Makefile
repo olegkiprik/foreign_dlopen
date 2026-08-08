@@ -47,7 +47,7 @@ endif
 
 ASFLAGS = $(CFLAGS)
 
-OBJS := 
+OBJS := main.o
 OBJS += $(patsubst %.S,%.o, $(wildcard $(ARCH)/*.S))
 
 ifeq "$(SMALL)" "1"
