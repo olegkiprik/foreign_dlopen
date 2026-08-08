@@ -1,9 +1,11 @@
 #include <stdlib.h>
 
+/* -fno-builtin */
+#if 0
 /* satisfy compiler-emitted calls under -O2/-Os with no libc */
 void *memset(void *s, int c, size_t n) __attribute__((alias("z_memset")));
 void *memcpy(void *d, const void *s, size_t n) __attribute__((alias("z_memcpy")));
-
+#endif
 
 void *z_memset(void *s, int c, size_t n)
 {

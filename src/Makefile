@@ -3,6 +3,7 @@
 ARCH ?= amd64
 SMALL = 0
 DEBUG = 0
+CC=clang
 
 ARCHS32 := i386 arm
 ARCHS64 := amd64 aarch64
@@ -10,9 +11,9 @@ ARCHS := $(ARCHS32) $(ARCHS64)
 
 CFLAGS_i386 = -m32
 
-CFLAGS += -pipe -Wall -Wextra -fPIC -fno-ident -fno-stack-protector -U _FORTIFY_SOURCE -Wa,--noexecstack
+CFLAGS += -pipe -fno-builtin -Wall -Wextra -fno-PIC -fno-ident -fno-stack-protector -U _FORTIFY_SOURCE -Wa,--noexecstack
 LDFLAGS += -nostartfiles -nodefaultlibs -nostdlib -e z_start
-LDFLAGS += -pie -Wl,-Bsymbolic,--no-undefined,--build-id=none -static -Wl,-Ttext-segment=0x66660000
+LDFLAGS += -Wl,-Bsymbolic,--no-undefined,--build-id=none -static -Wl,-Ttext-segment=0x66660000
 TARGET := foreign_dlopen_demo
 
 ifeq "$(filter $(ARCH),$(ARCHS))" ""
@@ -34,9 +35,15 @@ else
   CFLAGS += -fvisibility=hidden
   # Disable unwind info to make prog smaller.
   CFLAGS += -fno-asynchronous-unwind-tables -fno-unwind-tables
-  #CFLAGS += -Os #causes issues on arm z_printf, and any optimizations cause issues on amd64
-  CFLAGS += -O0
-  LDFLAGS += -s
+  #CFLAGS += -Os # causes issues on arm z_printf, and 
+                 #
+		 # any optimizations cause issues on amd64
+		 # ?
+		 #
+		 # let's take a risk
+  CFLAGS += -Os -fno-pie
+  # Strip later
+  # LDFLAGS += -s
 endif
 
 ASFLAGS = $(CFLAGS)
