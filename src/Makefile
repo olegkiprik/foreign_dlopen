@@ -35,8 +35,7 @@ else
   CFLAGS += -fvisibility=hidden
   # Disable unwind info to make prog smaller.
   CFLAGS += -fno-asynchronous-unwind-tables -fno-unwind-tables
-  #CFLAGS += -Os # causes issues on arm z_printf, and 
-                 #
+  #CFLAGS += -Os # causes issues on arm z_printf, and
 		 # any optimizations cause issues on amd64
 		 # ?
 		 #
@@ -48,7 +47,7 @@ endif
 
 ASFLAGS = $(CFLAGS)
 
-OBJS := loader.o z_err.o z_printf.o z_syscalls.o z_utils.o fdl_resolve.o
+OBJS := 
 OBJS += $(patsubst %.S,%.o, $(wildcard $(ARCH)/*.S))
 
 ifeq "$(SMALL)" "1"
