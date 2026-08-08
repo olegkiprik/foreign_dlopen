@@ -1,5 +1,4 @@
 
-
 #define RARELY(x) (__builtin_expect_with_probability((x), 0, 0.9))
 
 #define ASSERT(x)                                                                                              \
@@ -668,9 +667,6 @@ static int fdl_resolve_from_maps(unsigned long interp_base)
 }
 
 #define RTLD_NOW 0x0002
-
-extern unsigned long g_interp_base;
-
 #define SYS_EXIT 0x3c
 
 static void sys_exit(int status)
@@ -679,6 +675,80 @@ static void sys_exit(int status)
 	unn_syscall_result rax;
 	syscall1((long)status, SYS_EXIT, &rax);
 	(void)rax;
+}
+
+double (*my_fabs)(double) = NULL;
+double (*my_fmod)(double) = NULL;
+double (*my_exp)(double) = NULL;
+double (*my_log)(double) = NULL;
+double (*my_log10)(double) = NULL;
+double (*my_pow)(double, double) = NULL;
+double (*my_sqrt)(double) = NULL;
+double (*my_sin)(double) = NULL;
+double (*my_cos)(double) = NULL;
+double (*my_tan)(double) = NULL;
+double (*my_asin)(double) = NULL;
+double (*my_acos)(double) = NULL;
+double (*my_atan)(double) = NULL;
+double (*my_atan2)(double, double) = NULL;
+double (*my_sinh)(double) = NULL;
+double (*my_cosh)(double) = NULL;
+double (*my_tanh)(double) = NULL;
+double (*my_ceil)(double) = NULL;
+double (*my_floor)(double) = NULL;
+double (*my_frexp)(double) = NULL;
+double (*my_ldexp)(double) = NULL;
+double (*my_modf)(double) = NULL;
+
+void *my_pthread_atfork = NULL;
+void *my_pthread_attr_init = NULL;
+void *my_pthread_attr_destroy = NULL;
+void *my_pthread_cancel = NULL;
+void *my_pthread_cleanup_push = NULL;
+void *my_pthread_cleanup_pop = NULL;
+void *my_pthread_cond_init = NULL;
+void *my_pthread_cond_signal = NULL;
+void *my_pthread_cond_broadcast = NULL;
+void *my_pthread_cond_wait = NULL;
+void *my_pthread_cond_timedwait = NULL;
+void *my_pthread_cond_destroy = NULL;
+void *my_pthread_create = NULL;
+void *my_pthread_detach = NULL;
+void *my_pthread_equal = NULL;
+void *my_pthread_exit = NULL;
+void *my_pthread_key_create = NULL;
+void *my_pthread_key_delete = NULL;
+void *my_pthread_setspecific = NULL;
+void *my_pthread_getspecific = NULL;
+void *my_pthread_kill = NULL;
+void *my_pthread_mutex_lock = NULL;
+void *my_pthread_mutex_unlock = NULL;
+void *my_pthread_mutex_trylock = NULL;
+void *my_pthread_mutex_init = NULL;
+void *my_pthread_mutex_destroy = NULL;
+void *my_pthread_mutexattr_destroy = NULL;
+void *my_pthread_mutexattr_init = NULL;
+void *my_pthread_join = NULL;
+
+extern unsigned long g_interp_base;
+
+struct worker_str {
+	void *printff;
+	void *sleepf;
+};
+
+static void *worker(void *foo)
+{
+	struct worker_str *ffd;
+	ffd = foo;
+
+	(*(int (*)(const char *, ...))ffd->printff)("One\n");
+	(*(int (*)(unsigned int))ffd->sleepf)(1000000);
+	(*(int (*)(const char *, ...))ffd->printff)("Two\n");
+	(*(int (*)(unsigned int))ffd->sleepf)(1000000);
+	(*(int (*)(const char *, ...))ffd->printff)("Three\n");
+
+	return NULL;
 }
 
 // MUST ensure that stack is 16 byte aligned for calls to external functions
@@ -693,6 +763,18 @@ extern void fdl_entry_impl(void)
 	void *m;
 	float (*my_sinf)(float);
 	int exit_status;
+
+	void *p;
+	void *sleepf;
+	void *pth_create;
+	void *pth_join;
+
+	unsigned long tid1;
+	unsigned long tid2;
+	struct worker_str ws1;
+	struct worker_str ws2;
+
+	void *dummy;
 
 	exit_status = 0;
 
@@ -720,6 +802,47 @@ extern void fdl_entry_impl(void)
 	}
 
 	(*libc_printf)("sine of 3.14/3 is %f\n", (*my_sinf)(3.14 / 3));
+
+	p = (*my_dlopen)("libpthread.so.0", RTLD_NOW);
+	if (p == NULL) {
+		goto l_exit_failure;
+	}
+
+	sleepf = (*my_dlsym)(h, "usleep");
+	if (sleepf == NULL) {
+		goto l_exit_failure;
+	}
+
+	pth_create = (*my_dlsym)(p, "pthread_create");
+	if (!pth_create) {
+		goto l_exit_failure;
+	}
+
+	pth_join = (*my_dlsym)(p, "pthread_join");
+	if (!pth_join) {
+		goto l_exit_failure;
+	}
+
+	ws1.printff = ws2.printff = libc_printf;
+	ws1.sleepf = ws2.sleepf = sleepf;
+
+	if (0 != (*(int (*)(unsigned long *, const void *, void *(*)(void *), void *))pth_create)(
+		     &tid1, NULL, worker, &ws1)) {
+		goto l_exit_failure;
+	}
+
+	if (0 != (*(int (*)(unsigned long *, const void *, void *(*)(void *), void *))pth_create)(
+		     &tid2, NULL, worker, &ws2)) {
+		goto l_exit_failure;
+	}
+
+	if (0 != (*(int (*)(unsigned long, void **))pth_join)(tid1, &dummy)) {
+		goto l_exit_failure;
+	}
+
+	if (0 != (*(int (*)(unsigned long, void **))pth_join)(tid2, &dummy)) {
+		goto l_exit_failure;
+	}
 
 l_exit:
 	sys_exit(exit_status);
