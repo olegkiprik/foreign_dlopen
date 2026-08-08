@@ -1,6 +1,11 @@
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <syscall.h>
 
-void z_exit(int status);
-void exec_elf(const char *file, int argc, char *argv[]);
+static void z_exit(int status);
+__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char *argv[]);
 
 #define DL_APP_DEFAULT "/bin/sleep"
 
@@ -22,9 +27,9 @@ int main(int argc, char *argv[])
 	z_exit(0);
 }
 
-#include <stdlib.h>
 
-void *z_memset(void *s, int c, size_t n)
+
+static void *z_memset(void *s, int c, size_t n)
 {
 	unsigned char *p = s, *e = p + n;
 	while (p < e)
@@ -32,7 +37,7 @@ void *z_memset(void *s, int c, size_t n)
 	return s;
 }
 
-void *z_memcpy(void *dest, const void *src, size_t n)
+static void *z_memcpy(void *dest, const void *src, size_t n)
 {
 	unsigned char *d = dest;
 	const unsigned char *p = src, *e = p + n;
@@ -41,7 +46,7 @@ void *z_memcpy(void *dest, const void *src, size_t n)
 	return dest;
 }
 
-char *z_strstr(const char *h, const char *n)
+static char *z_strstr(const char *h, const char *n)
 {
 	if (!*n)
 		return (char *)h;
@@ -59,7 +64,7 @@ char *z_strstr(const char *h, const char *n)
 	return NULL;
 }
 
-int z_strcmp(const char *a, const char *b)
+static int z_strcmp(const char *a, const char *b)
 {
 	while (*a && (*a == *b))
 	{
@@ -69,18 +74,13 @@ int z_strcmp(const char *a, const char *b)
 	return (unsigned char)*a - (unsigned char)*b;
 }
 
-#include <syscall.h>
+
 
 #define PRIVATE __attribute__((visibility ("hidden")))
 
 PRIVATE long z_syscall(int n, ...);
 
 static int errno;
-
-int *z_perrno(void)
-{
-	return &errno;
-}
 
 static long check_error(long rc)
 {
@@ -93,17 +93,17 @@ static long check_error(long rc)
 
 #define SYSCALL(name, ...)  check_error(z_syscall(SYS_##name, __VA_ARGS__))
 #define DEF_SYSCALL1(ret, name, t1, a1) \
-ret z_##name(t1 a1) \
+static ret z_##name(t1 a1) \
 { \
 	return (ret)SYSCALL(name, a1); \
 }
 #define DEF_SYSCALL2(ret, name, t1, a1, t2, a2) \
-ret z_##name(t1 a1, t2 a2) \
+static ret z_##name(t1 a1, t2 a2) \
 { \
 	return (ret)SYSCALL(name, a1, a2); \
 }
 #define DEF_SYSCALL3(ret, name, t1, a1, t2, a2, t3, a3) \
-ret z_##name(t1 a1, t2 a2, t3 a3) \
+static ret z_##name(t1 a1, t2 a2, t3 a3) \
 { \
 	return (ret)SYSCALL(name, a1, a2, a3); \
 }
@@ -111,13 +111,12 @@ ret z_##name(t1 a1, t2 a2, t3 a3) \
 DEF_SYSCALL1(void, exit, int, status)
 DEF_SYSCALL2(int, open, const char *, filename, int, flags)
 DEF_SYSCALL3(ssize_t, read, int, fd, void *, buf, size_t, count)
-DEF_SYSCALL3(ssize_t, write, int, fd, const void *, buf, size_t, count)
 DEF_SYSCALL1(int, close, int, fd)
 DEF_SYSCALL3(int, lseek, int, fd, off_t, off, int, whence)
 DEF_SYSCALL2(int, munmap, void *, addr, size_t, length)
 DEF_SYSCALL3(int, mprotect, void *, addr, size_t, length, int, prot)
 
-void *
+static void *
 z_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
 	/* i386 has map (old_mmap) and mmap2, old_map is a legacy single arg
@@ -131,12 +130,13 @@ z_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 #endif
 }
 
-#include <sys/mman.h>
-#include <elf.h>
-#include <fcntl.h>
+
 
 PRIVATE void z_trampo(void (*entry)(void), unsigned long *sp, void (*fini)(void));
+
+
 PRIVATE void z_fdl_entry(void);
+
 
 #define z_alloca __builtin_alloca
 
@@ -161,9 +161,9 @@ PRIVATE void z_fdl_entry(void);
 #  error "ELFCLASS is not defined"
 #endif
 
-int fdl_resolve_from_maps(unsigned long interp_base);
-void *fdl_dlopen_sym(void *p);
-void *fdl_dlsym_sym(void *p);
+static int fdl_resolve_from_maps(unsigned long interp_base);
+static void *fdl_dlopen_sym(void *p);
+static void *fdl_dlsym_sym(void *p);
 
 #define PAGE_SIZE 4096
 #define ALIGN (PAGE_SIZE - 1)
@@ -309,16 +309,7 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 	main(argc, argv);
 }
 
-void init_exec_elf(char *argv[])
-{
-	/* We assume that argv comes from the original executable params. */
-	if (entry_sp == NULL)
-	{
-		entry_sp = (unsigned long *)argv - 1;
-	}
-}
-
-void exec_elf(const char *file, int argc, char *argv[])
+__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char *argv[])
 {
 	Elf_Ehdr ehdrs[2], *ehdr = ehdrs;
 	Elf_Phdr *phdr, *iter;
@@ -459,7 +450,7 @@ void exec_elf(const char *file, int argc, char *argv[])
 static unsigned long text_base;
 static const char *soname;
 
-void *fdl_dlopen_sym(void *p)
+static void *fdl_dlopen_sym(void *p)
 {
     static void *g_fdl_dlopen = NULL;
     if (p)
@@ -467,7 +458,7 @@ void *fdl_dlopen_sym(void *p)
     return g_fdl_dlopen;
 }
 
-void *fdl_dlsym_sym(void *p)
+static void *fdl_dlsym_sym(void *p)
 {
     static void *g_fdl_dlsym = NULL;
     if (p)
@@ -829,7 +820,7 @@ static void *resolve_sym(mod_t *m, const char *name)
     return (void *)(m->base + s->st_value);
 }
 
-int fdl_resolve_from_maps(unsigned long interp_base)
+static int fdl_resolve_from_maps(unsigned long interp_base)
 {
     if (find_libc_base() < 0)
     {
