@@ -1,18 +1,8 @@
 # foreign-dlopen
 
-Fork from [pfalcon/foreign-dlopen](https://github.com/pfalcon/foreign-dlopen).
-Please see [Details](#details) for how this fork deviates from the original.
+Fork from [Caesurus/foreign-dlopen](https://github.com/Caesurus/foreign-dlopen)
 
-Some general notes:
-- The original project has a #define for being able to use STDLIB. This has
-been removed here. It's not needed, and therefore can be eliminated.
-- This PoC was created and tested on a Linux 6.x Kernel with GLIBC 2.40-3.
-The parsing of the maps "file" and the locating of the symbols will possibly
-differ on different systems with different libc implementations, porting to
-those systems is left as future work.
-- Limited testing has been done, this is a weekend project and I don't have
-time to pour into this, it's provided as-is. Contributions welcome.
-- If you find something that's broken, feel free to fix and issue a pull request.
+which is a fork from [pfalcon/foreign-dlopen](https://github.com/pfalcon/foreign-dlopen)
 
 ## Intro
 
@@ -124,17 +114,7 @@ so we will need to ensure it is before calling the functions in libc.
 1. `cd src`
 2. Build static, stdlib-less sample application: `make`.
 4. Run the sample: `./foreign_dlopen_demo`. While it is static, it will
-dynamically load `libc.so.6` and call `printf()` from it.
-
-### Armv7
-
-1. `cd src`
-2. Use crosscompile toolchain of your choice. Here is a simple one you can use.
-```bash
-docker run --rm dockcross/linux-armv7l-musl:latest > ./dockcross && chmod +x ./dockcross
-sudo ./dockcross make clean all
-```
-
+dynamically load `libc.so.6`, `libm.so.6` and `libpthread.so.0`.
 
 ## Credits
 
@@ -142,6 +122,3 @@ sudo ./dockcross make clean all
 implementation is based on the ELF loader by Mikhail Ilyin:
 https://github.com/MikhailProg/elf.
 
-The original project this was forked from:
-https://github.com/pfalcon/foreign-dlopen
----
