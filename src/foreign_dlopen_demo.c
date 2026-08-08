@@ -22,13 +22,7 @@ int main(int argc, char *argv[])
 	z_exit(0);
 }
 
-
-
 #include <stdlib.h>
-
-/* satisfy compiler-emitted calls under -O2/-Os with no libc */
-// void *memset(void *s, int c, size_t n) __attribute__((alias("z_memset")));
-// void *memcpy(void *d, const void *s, size_t n) __attribute__((alias("z_memcpy")));
 
 void *z_memset(void *s, int c, size_t n)
 {
@@ -75,10 +69,7 @@ int z_strcmp(const char *a, const char *b)
 	return (unsigned char)*a - (unsigned char)*b;
 }
 
-
-
 #include <syscall.h>
-#include <unistd.h>
 
 #define PRIVATE __attribute__((visibility ("hidden")))
 
@@ -140,50 +131,14 @@ z_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 #endif
 }
 
-
-
-
-#include <sys/types.h>
-#include <stdarg.h>
-
-ssize_t z_write(int fd, const void *buf, size_t count);
-
-#define OUTBUFSIZE 128
-
-
-
-
-#include <stdarg.h>
-
-void z_exit(int status);
-void z_vfdprintf(int fd, const char *fmt, va_list ap);
-// void z_fdprintf(int fd, const char *fmt, ...)
-	// __attribute__((format(printf, 2, 3)));
-
-
 #include <sys/mman.h>
-#include <stdlib.h>
 #include <elf.h>
 #include <fcntl.h>
-
-#define PRIVATE __attribute__((visibility ("hidden")))
 
 PRIVATE void z_trampo(void (*entry)(void), unsigned long *sp, void (*fini)(void));
 PRIVATE void z_fdl_entry(void);
 
-
-void z_exit(int status);
-int z_open(const char *pathname, int flags);
-int z_lseek(int fd, off_t offset, int whence);
-ssize_t z_read(int fd, void *buf, size_t count);
-void *z_mmap(void *addr, size_t length, int prot,
-			 int flags, int fd, off_t offset);
-int z_munmap(void *addr, size_t length);
-int z_mprotect(void *addr, size_t length, int prot);
-
 #define z_alloca __builtin_alloca
-
-void *z_memcpy(void *dest, const void *src, size_t n);
 
 
 #if !defined(ELFCLASS)
@@ -228,7 +183,6 @@ static unsigned long g_interp_base = 0;
 
 static void z_fini(void)
 {
-	// z_printf("Fini at work: x_fini %p\n", x_fini);
 	if (x_fini != NULL)
 		x_fini();
 }
@@ -237,7 +191,6 @@ static void z_fini(void)
 // especially ones with variadic arguments. We do this via the z_fdlentry.S wrapper
 void fdl_entry_impl(void)
 {
-	// z_printf("Loader is in memory... Start parsing logic\n");
 	if (fdl_resolve_from_maps(g_interp_base) == 0)
 	{
 #ifndef RTLD_NOW
@@ -247,17 +200,14 @@ void fdl_entry_impl(void)
 		void *(*my_dlsym)(void *, const char *) = (void *(*)(void *, const char *))fdl_dlsym_sym(NULL);
 		int (*libc_printf)(const char *, ...) = 0;
 
-		// z_printf("fdl: dlopen=%p dlsym=%p\n", my_dlopen, my_dlsym);
-
 		void *h = my_dlopen(NULL, RTLD_NOW);
-		// z_printf("handle: %p\n", h);
 
 		libc_printf = (int (*)(const char *, ...))my_dlsym(h, "printf");
-		// z_printf("libc_printf: %p\n", libc_printf);
+		
 
 		if (libc_printf)
 			libc_printf("[libc printf] hello via foreign dlopen\n");
-		// z_printf("Done\n");
+		
 	}
 	z_exit(0);
 }
@@ -346,8 +296,6 @@ err:
 
 #define Z_PROG 0
 #define Z_INTERP 1
-
-int main(int argc, char *argv[]);
 
 void z_entry(unsigned long *sp, void (*fini)(void))
 {
@@ -491,56 +439,18 @@ void exec_elf(const char *file, int argc, char *argv[])
 	{
 		g_interp_base = base[Z_INTERP];
 	}
-	// z_printf("base: 0x%lx\n", interp_base);
+	
 
-	// z_printf("Calling trampo...file: %s, interp: %s\n", file ? file : "(null)", elf_interp ? elf_interp : "(null)");
+	
 	z_trampo((void (*)(void))(elf_interp ? entry[Z_INTERP] : entry[Z_PROG]), sp, z_fini);
 	/* Should not reach. */
 	z_exit(0);
 }
 
 
-
-#include <elf.h>
-#include <stdlib.h>
-#include <fcntl.h>
-
-#if !defined(ELFCLASS)
-#define ELFCLASS ELFCLASS64
-#endif
-
-#if ELFCLASS == ELFCLASS64
-#  define Elf_Ehdr	Elf64_Ehdr
-#  define Elf_Phdr	Elf64_Phdr
-#  define Elf_Sym   Elf64_Sym
-#  define Elf_Dyn   Elf64_Dyn
-#  define Elf_auxv_t	Elf64_auxv_t
-#elif ELFCLASS == ELFCLASS32
-#  define Elf_Ehdr	Elf32_Ehdr
-#  define Elf_Phdr	Elf32_Phdr
-#  define Elf_Sym   Elf32_Sym
-#  define Elf_Dyn   Elf32_Dyn
-#  define Elf_auxv_t	Elf32_auxv_t
-#else
-#  error "ELFCLASS is not defined"
-#endif
-
 #ifndef ELF_ST_TYPE
 #define ELF_ST_TYPE(i) ((i) & 0xF)
 #endif
-
-int z_open(const char *pathname, int flags);
-int z_close(int fd);
-ssize_t z_read(int fd, void *buf, size_t count);
-
-void *z_memset(void *s, int c, size_t n);
-int z_strcmp(const char *a, const char *b);
-char *z_strstr(const char *haystack, const char *needle);
-
-// void z_printf(const char *fmt, ...)
-	// __attribute__((format(printf, 1, 2)));
-// void z_fdprintf(int fd, const char *fmt, ...)
-	// __attribute__((format(printf, 2, 3)));
 
 #ifndef MAPS_PATH
 #define MAPS_PATH "/proc/self/maps"
@@ -699,16 +609,13 @@ static int find_libc_base(void)
         unsigned long start = 0, off = 0;
         char perms[5];
         const char *path = NULL;
-        // z_printf("Line to check %s\n", line);
         if (z_strstr(line, "libc"))
         {
-            // z_printf("Line with libc: %s\n", line);
             if (parse_maps_line(line, &start, perms, &off, &path) == 0 &&
                 path && off == 0)
             {
                 text_base = start;
                 soname = path;
-                // z_fdprintf(2, "libc base 0x%lx @ %s\n", text_base, soname);
                 cached = 1;
                 cached_base = text_base;
                 cached_name = soname;
@@ -754,9 +661,6 @@ static int mod_init(mod_t *m, unsigned long base)
         return -1;
 
     m->ph = (Elf_Phdr *)(base + m->eh->e_phoff);
-//     z_fdprintf(2, "mod_init: base=0x%lx phoff=0x%lx phnum=%u entsz=%u\n",
-        //        base, (unsigned long)m->eh->e_phoff,
-        //        (unsigned)m->eh->e_phnum, (unsigned)m->eh->e_phentsize);
 
     unsigned long lo = ~0UL, hi = 0;
     for (int i = 0; i < m->eh->e_phnum; i++)
@@ -781,18 +685,14 @@ static int mod_init(mod_t *m, unsigned long base)
             unsigned long dyn_addr = base + m->ph[i].p_vaddr;
             if (dyn_addr < lo || dyn_addr + sizeof(Elf_Dyn) > hi)
             {
-                // z_fdprintf(2, "mod_init: PT_DYNAMIC out of range: 0x%lx [0x%lx..0x%lx)\n",
-                        //    dyn_addr, lo, hi);
                 return -1;
             }
             m->dyn = (Elf_Dyn *)dyn_addr;
-        //     z_fdprintf(2, "mod_init: PT_DYNAMIC @ 0x%lx\n", dyn_addr);
             break;
         }
     }
     if (!m->dyn)
     {
-        // z_fdprintf(2, "mod_init: no PT_DYNAMIC\n");
         return -1;
     }
 
@@ -834,7 +734,6 @@ static int mod_init(mod_t *m, unsigned long base)
             break;
         }
     }
-//     z_fdprintf(2, "mod_init: dynsym=%p dynstr=%p gnu_hash=%p sysv_hash=%p\n", m->dynsym, m->dynstr, m->gnu_buckets, m->buckets);
 
     return (m->dynsym && m->dynstr) ? 0 : -1;
 }
@@ -910,21 +809,17 @@ static Elf_Sym *lookup_sysv(mod_t *m, const char *name)
 static void *resolve_sym(mod_t *m, const char *name)
 {
     Elf_Sym *s = NULL;
-    //z_printf("resolve_sym: %s\n", name);
 
     if (!s)
     {
-        //z_printf("lookup_gnu\n");
         s = lookup_gnu(m, name);
     }
     if (!s)
     {
-        //z_printf("lookup_sysv\n");
         s = lookup_sysv(m, name);
     }
     if (!s)
     {
-        //z_printf("symbol not found\n");
         return NULL;
     }
     if (ELF_ST_TYPE(s->st_info) != STT_FUNC && ELF_ST_TYPE(s->st_info) != STT_GNU_IFUNC)
@@ -940,7 +835,6 @@ int fdl_resolve_from_maps(unsigned long interp_base)
     {
         if (interp_base)
         {
-        //     z_printf("Falling back to the interpreter, for muslc the loader/libc are the same \n");
             text_base = interp_base;
         }
         else
