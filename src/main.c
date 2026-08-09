@@ -180,15 +180,13 @@ static int read_all(int fd, char *buf, int sz)
 
 static int gl_cached = 0;
 static unsigned long text_base = 0;
-
 static const char *gl_cached_name = NULL;
 static unsigned long gl_cached_base = 0;
 static const char *soname = NULL;
 
 #define LONG_MAX 0x7fffFFFFffffFFFF
-#define AT_FDCWD (-100)
 #define ULONG_MAX 0xffffFFFFffffFFFFu
-
+#define AT_FDCWD (-100)
 #define SYS_OPENAT 0x101
 
 static long sys_openat(long dirfd, const void *restrict pathname, long flags, int *restrict result)
@@ -275,6 +273,7 @@ static long sys_close(long fd)
 }
 
 #define MAPS_PATH "/proc/self/maps"
+#define O_RDONLY 0x0
 
 static char *z_strstr(const char *h, const char *n)
 {
@@ -291,7 +290,6 @@ static char *z_strstr(const char *h, const char *n)
 	}
 	return NULL;
 }
-#define O_RDONLY 0x0
 
 /* parse one /proc/self/maps line; returns 0 on success */
 static int parse_maps_line(const char *line, unsigned long *start, char *perms_out, unsigned long *offset,
@@ -417,7 +415,6 @@ static void *dyn_ptr(unsigned long base, unsigned long lo, unsigned long hi, uns
 }
 
 #define PT_LOAD 1 /* Loadable program segment */
-
 #define DT_NULL 0	       /* Marks end of dynamic section */
 #define PT_DYNAMIC 2	       /* Dynamic linking information */
 #define DT_STRTAB 5	       /* Address of string table */
@@ -428,6 +425,7 @@ static void *dyn_ptr(unsigned long base, unsigned long lo, unsigned long hi, uns
 /* The versioning entry types.  The next are defined as part of the
    GNU extension.  */
 #define DT_VERSYM 0x6ffffff0
+
 static int mod_init(mod_t *m, unsigned long base)
 {
 	m->base = base;
@@ -504,22 +502,6 @@ static int mod_init(mod_t *m, unsigned long base)
 	return m->dynsym && m->dynstr ? 0 : -1;
 }
 
-static void *gl_g_fdl_dlopen = NULL;
-static void *gl_g_fdl_dlsym = NULL;
-
-static void *fdl_dlopen_sym(void *p)
-{
-	if (p)
-		gl_g_fdl_dlopen = p;
-	return gl_g_fdl_dlopen;
-}
-
-static void *fdl_dlsym_sym(void *p)
-{
-	if (p)
-		gl_g_fdl_dlsym = p;
-	return gl_g_fdl_dlsym;
-}
 #define size_t unsigned long
 
 static void *z_memset(void *s, int c, size_t n)
@@ -615,10 +597,10 @@ static Elf_Sym *lookup_sysv(mod_t *restrict m, const char *restrict name)
 }
 
 #define ELF_ST_TYPE(i) ((i) & 0xF)
-
 #define STT_FUNC 2 /* Symbol is a code object */
-
 #define STT_GNU_IFUNC 10 /* Symbol is indirect code object */
+#define RTLD_NOW 0x0002
+#define SYS_EXIT 0x3c
 
 static void *resolve_sym(mod_t *restrict m, const char *restrict name)
 {
@@ -639,39 +621,8 @@ static void *resolve_sym(mod_t *restrict m, const char *restrict name)
 	return (void *)(m->base + s->st_value);
 }
 
-static int fdl_resolve_from_maps(unsigned long interp_base)
-{
-	if (0 > find_libc_base()) {
-		if (interp_base != 0) {
-			text_base = interp_base;
-		} else {
-			return -1;
-		}
-	}
-
-	mod_t M;
-	z_memset(&M, 0, sizeof M);
-	if (RARELY(mod_init(&M, text_base) < 0))
-		return -1;
-
-	/* glibc: prefer __libc_dlopen_mode; fallback to dlopen/dlsym */
-	void *dlopen = resolve_sym(&M, "__libc_dlopen_mode");
-	if (!dlopen)
-		dlopen = resolve_sym(&M, "dlopen");
-
-	void *dlsym = resolve_sym(&M, "dlsym");
-
-	fdl_dlopen_sym(dlopen);
-	fdl_dlsym_sym(dlsym);
-	return dlopen && dlsym ? 0 : -1;
-}
-
-#define RTLD_NOW 0x0002
-#define SYS_EXIT 0x3c
-
 static void sys_exit(int status)
 {
-	/* too long assembly because of 'int' */
 	unn_syscall_result rax;
 	syscall1((long)status, SYS_EXIT, &rax);
 	(void)rax;
@@ -730,7 +681,15 @@ void *my_pthread_mutexattr_destroy = NULL;
 void *my_pthread_mutexattr_init = NULL;
 void *my_pthread_join = NULL;
 
+void *(*my_dlopen)(const char *, int) = NULL;
+void *(*my_dlsym)(void *restrict, const char *restrict) = NULL;
+int (*my_dlclose)(void *) = NULL;
+
 extern unsigned long g_interp_base;
+
+#include "my_dlfcn.h"
+
+/* example */
 
 struct worker_str {
 	void *printff;
@@ -751,20 +710,20 @@ static void *worker(void *foo)
 	return NULL;
 }
 
-// MUST ensure that stack is 16 byte aligned for calls to external functions
-// especially ones with variadic arguments. We do this via the z_fdlentry.S wrapper
+/* MUST ensure that stack is 16 byte aligned for calls to external functions */
+/* especially ones with variadic arguments. We do this via the z_fdlentry.S wrapper */
 extern void fdl_entry_impl(void)
 {
-	void *(*my_dlopen)(const char *, int);
-	void *(*my_dlsym)(void *, const char *);
-	int (*libc_printf)(const char *, ...);
-	void *h;
-
+	void *c;
 	void *m;
-	float (*my_sinf)(float);
-	int exit_status;
-
 	void *p;
+
+	void *tmp_dlopen;
+	void *tmp_dlsym;
+	void *tmp_dlclose;
+
+	int (*my_printf)(const char *restrict, ...);
+	float (*my_sinf)(float);
 	void *sleepf;
 	void *pth_create;
 	void *pth_join;
@@ -773,57 +732,85 @@ extern void fdl_entry_impl(void)
 	unsigned long tid2;
 	struct worker_str ws1;
 	struct worker_str ws2;
-
 	void *dummy;
+	int exit_status;
+
+	mod_t M;
 
 	exit_status = 0;
 
-	if (RARELY(fdl_resolve_from_maps(g_interp_base) != 0)) {
-		goto l_exit;
+	if (0 > find_libc_base()) {
+		if (g_interp_base != 0) {
+			text_base = g_interp_base;
+		} else {
+			goto l_exit_failure;
+		}
 	}
 
-	my_dlopen = fdl_dlopen_sym(NULL);
-	my_dlsym = fdl_dlsym_sym(NULL);
-	h = (*my_dlopen)(NULL, RTLD_NOW);
-	libc_printf = (*my_dlsym)(h, "printf");
+	z_memset(&M, 0, sizeof M);
+	if (RARELY(mod_init(&M, text_base) < 0))
+		goto l_exit_failure;
 
-	m = (*my_dlopen)("libm.so.6", RTLD_NOW);
+	/* glibc: prefer __libc_dlopen_mode; fallback to dlopen/dlsym */
+
+	tmp_dlopen = resolve_sym(&M, "__libc_dlopen_mode");
+	if (!tmp_dlopen) {
+		tmp_dlopen = resolve_sym(&M, "dlopen");
+	}
+
+	tmp_dlsym = resolve_sym(&M, "dlsym");
+	tmp_dlclose = resolve_sym(&M, "dlclose");
+
+	if (!tmp_dlopen || !tmp_dlsym || !tmp_dlclose) {
+		goto l_exit_failure;
+	}
+
+	my_dlopen = tmp_dlopen;
+	my_dlsym = tmp_dlsym;
+	my_dlclose = tmp_dlclose;
+
+	/* my_dlfcn.h */
+
+	c = dlopen(NULL, RTLD_NOW);
+	my_printf = dlsym(c, "printf");
+
+	m = dlopen("libm.so.6", RTLD_NOW);
 	if (RARELY(m == NULL)) {
 		goto l_exit_failure;
 	}
 
-	my_sinf = (*my_dlsym)(m, "sinf");
+	my_sinf = dlsym(m, "sinf");
 	if (RARELY(my_sinf == NULL)) {
 		goto l_exit_failure;
 	}
 
-	if (RARELY(libc_printf == NULL)) {
+	if (RARELY(my_printf == NULL)) {
 		goto l_exit_failure;
 	}
 
-	(*libc_printf)("sine of 3.14/3 is %f\n", (*my_sinf)(3.14 / 3));
+	(*my_printf)("sine of 3.14/3 is %f\n", (*my_sinf)(3.14 / 3));
 
-	p = (*my_dlopen)("libpthread.so.0", RTLD_NOW);
+	p = dlopen("libpthread.so.0", RTLD_NOW);
 	if (p == NULL) {
 		goto l_exit_failure;
 	}
 
-	sleepf = (*my_dlsym)(h, "usleep");
+	sleepf = dlsym(c, "usleep");
 	if (sleepf == NULL) {
 		goto l_exit_failure;
 	}
 
-	pth_create = (*my_dlsym)(p, "pthread_create");
+	pth_create = dlsym(p, "pthread_create");
 	if (!pth_create) {
 		goto l_exit_failure;
 	}
 
-	pth_join = (*my_dlsym)(p, "pthread_join");
+	pth_join = dlsym(p, "pthread_join");
 	if (!pth_join) {
 		goto l_exit_failure;
 	}
 
-	ws1.printff = ws2.printff = libc_printf;
+	ws1.printff = ws2.printff = my_printf;
 	ws1.sleepf = ws2.sleepf = sleepf;
 
 	if (0 != (*(int (*)(unsigned long *, const void *, void *(*)(void *), void *))pth_create)(
@@ -844,6 +831,10 @@ extern void fdl_entry_impl(void)
 		goto l_exit_failure;
 	}
 
+	(void)dlclose(p);
+	(void)dlclose(m);
+	(void)dlclose(c);
+
 l_exit:
 	sys_exit(exit_status);
 
@@ -851,3 +842,4 @@ l_exit_failure:
 	exit_status = 1;
 	goto l_exit;
 }
+
