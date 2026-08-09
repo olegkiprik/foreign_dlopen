@@ -1,6 +1,7 @@
 
+/* custom macros */
 #define RARELY(x) (__builtin_expect_with_probability((x), 0, 0.9))
-
+#define OFTEN(x) (__builtin_expect_with_probability((x), 1, 0.9))
 #define ASSERT(x)                                                                                              \
 	do {                                                                                                   \
 		if (!(x)) {                                                                                    \
@@ -8,95 +9,98 @@
 		}                                                                                              \
 	} while (0)
 
-#define uint16_t unsigned short
-#define uint32_t unsigned int
-#define uint64_t unsigned long
-#define int64_t long
+#if !defined(NULL)
+#define NULL ((void *)0)
+#endif
 
-#define Elf_Ehdr Elf64_Ehdr
-#define Elf_Phdr Elf64_Phdr
-#define Elf_Sym Elf64_Sym
-#define Elf_Dyn Elf64_Dyn
-#define Elf_auxv_t Elf64_auxv_t
+#if !defined(INT_MAX)
+#define INT_MAX 0x7fffFFFF
+#endif
 
-typedef uint16_t Elf64_Half;
-typedef uint32_t Elf64_Word;
-typedef uint64_t Elf64_Addr;
-typedef uint64_t Elf64_Off;
-typedef uint64_t Elf64_Xword;
-typedef int64_t Elf64_Sxword;
+#if !defined(RTLD_NOW)
+#define RTLD_NOW 0x0002
+#endif
 
-#define EI_NIDENT (16)
+#if !defined(O_RDONLY)
+#define O_RDONLY 0x0
+#endif
+
+#if !defined(LONG_MAX)
+#define LONG_MAX 0x7fffFFFFffffFFFF
+#endif
+
+#if !defined(ULONG_MAX)
+#define ULONG_MAX 0xffffFFFFffffFFFFu
+#endif
+
+#if !defined(AT_FDCWD)
+#define AT_FDCWD (-100)
+#endif
 
 typedef struct {
-	unsigned char e_ident[EI_NIDENT]; /* Magic number and other info */
-	Elf64_Half e_type;		  /* Object file type */
-	Elf64_Half e_machine;		  /* Architecture */
-	Elf64_Word e_version;		  /* Object file version */
-	Elf64_Addr e_entry;		  /* Entry point virtual address */
-	Elf64_Off e_phoff;		  /* Program header table file offset */
-	Elf64_Off e_shoff;		  /* Section header table file offset */
-	Elf64_Word e_flags;		  /* Processor-specific flags */
-	Elf64_Half e_ehsize;		  /* ELF header size in bytes */
-	Elf64_Half e_phentsize;		  /* Program header table entry size */
-	Elf64_Half e_phnum;		  /* Program header table entry count */
-	Elf64_Half e_shentsize;		  /* Section header table entry size */
-	Elf64_Half e_shnum;		  /* Section header table entry count */
-	Elf64_Half e_shstrndx;		  /* Section header string table index */
+	unsigned char e_ident[16];  /* Magic number and other info */
+	unsigned short e_type;	    /* Object file type */
+	unsigned short e_machine;   /* Architecture */
+	unsigned int e_version;	    /* Object file version */
+	unsigned long e_entry;	    /* Entry point virtual address */
+	unsigned long e_phoff;	    /* Program header table file offset */
+	unsigned long e_shoff;	    /* Section header table file offset */
+	unsigned int e_flags;	    /* Processor-specific flags */
+	unsigned short e_ehsize;    /* ELF header size in bytes */
+	unsigned short e_phentsize; /* Program header table entry size */
+	unsigned short e_phnum;	    /* Program header table entry count */
+	unsigned short e_shentsize; /* Section header table entry size */
+	unsigned short e_shnum;	    /* Section header table entry count */
+	unsigned short e_shstrndx;  /* Section header string table index */
 } Elf64_Ehdr;
 
 typedef struct {
-	Elf64_Word p_type;    /* Segment type */
-	Elf64_Word p_flags;   /* Segment flags */
-	Elf64_Off p_offset;   /* Segment file offset */
-	Elf64_Addr p_vaddr;   /* Segment virtual address */
-	Elf64_Addr p_paddr;   /* Segment physical address */
-	Elf64_Xword p_filesz; /* Segment size in file */
-	Elf64_Xword p_memsz;  /* Segment size in memory */
-	Elf64_Xword p_align;  /* Segment alignment */
+	unsigned int p_type;	/* Segment type */
+	unsigned int p_flags;	/* Segment flags */
+	unsigned long p_offset; /* Segment file offset */
+	unsigned long p_vaddr;	/* Segment virtual address */
+	unsigned long p_paddr;	/* Segment physical address */
+	unsigned long p_filesz; /* Segment size in file */
+	unsigned long p_memsz;	/* Segment size in memory */
+	unsigned long p_align;	/* Segment alignment */
 } Elf64_Phdr;
 
 typedef struct {
-	Elf64_Sxword d_tag; /* Dynamic entry type */
+	long d_tag; /* Dynamic entry type */
 	union {
-		Elf64_Xword d_val; /* Integer value */
-		Elf64_Addr d_ptr;  /* Address value */
+		unsigned long d_val; /* Integer value */
+		unsigned long d_ptr; /* Address value */
 	} d_un;
 } Elf64_Dyn;
 
-typedef uint16_t Elf64_Section;
-
 typedef struct {
-	Elf64_Word st_name;	/* Symbol name (string tbl index) */
-	unsigned char st_info;	/* Symbol type and binding */
-	unsigned char st_other; /* Symbol visibility */
-	Elf64_Section st_shndx; /* Section index */
-	Elf64_Addr st_value;	/* Symbol value */
-	Elf64_Xword st_size;	/* Symbol size */
+	unsigned int st_name;	 /* Symbol name (string tbl index) */
+	unsigned char st_info;	 /* Symbol type and binding */
+	unsigned char st_other;	 /* Symbol visibility */
+	unsigned short st_shndx; /* Section index */
+	unsigned long st_value;	 /* Symbol value */
+	unsigned long st_size;	 /* Symbol size */
 } Elf64_Sym;
 
 /* In-memory ELF helpers */
 typedef struct {
-	Elf_Ehdr *eh;
-	Elf_Phdr *ph;
-	Elf_Dyn *dyn;
+	Elf64_Ehdr *eh;
+	Elf64_Phdr *ph;
+	Elf64_Dyn *dyn;
 	unsigned long base;
 	unsigned long nbucket, nchain;
-	uint32_t *buckets, *chains;
-	uint32_t *gnu_buckets;
-	uint32_t *gnu_chain;
-	uint32_t gnu_maskwords;
-	uint32_t gnu_shift2;
+	unsigned int *buckets, *chains;
+	unsigned int *gnu_buckets;
+	unsigned int *gnu_chain;
+	unsigned int gnu_maskwords;
+	unsigned int gnu_shift2;
 	unsigned long *gnu_bloom;
-	uint32_t gnu_nbucket;
-	uint32_t gnu_symoffset;
-	Elf_Sym *dynsym;
+	unsigned int gnu_nbucket;
+	unsigned int gnu_symoffset;
+	Elf64_Sym *dynsym;
 	const char *dynstr;
-	uint16_t *versym;
+	unsigned short *versym;
 } mod_t;
-
-static long find_libc_base(void);
-static int mod_init(mod_t *m, unsigned long base);
 
 typedef union unn_syscall_result_ {
 	long l;
@@ -104,18 +108,17 @@ typedef union unn_syscall_result_ {
 	void *p;
 } unn_syscall_result;
 
-#define NULL ((void *)0)
-
-#define INT_MAX 0x7fffFFFF
-#define SYS_READ 0x00
+static int gl_cached = 0;
+static unsigned long text_base = 0;
+static const char *gl_cached_name = NULL;
+static unsigned long gl_cached_base = 0;
+static const char *soname = NULL;
 
 static void syscall3(unsigned long a1, unsigned long a2, unsigned long a3, unsigned long n,
 		     unn_syscall_result *res)
 {
 	asm volatile("syscall" : "=a"(*res) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
 }
-
-#define OFTEN(x) (__builtin_expect_with_probability((x), 1, 0.9))
 
 static long sys_read(long fd, void *restrict buf, unsigned long nbytes, long *restrict result)
 {
@@ -130,7 +133,7 @@ static long sys_read(long fd, void *restrict buf, unsigned long nbytes, long *re
 	ASSERT(fd != STDERR_FILENO);
 #endif
 
-	syscall3((unsigned long)(long)fd, (unsigned long)buf, nbytes, SYS_READ, &rax);
+	syscall3((unsigned long)(long)fd, (unsigned long)buf, nbytes, 0x00, &rax);
 	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
 		return rax.l;
 	}
@@ -150,7 +153,6 @@ static long sys_read(long fd, void *restrict buf, unsigned long nbytes, long *re
 	return rax.l;
 }
 
-/* Minimal readers */
 static int read_all(int fd, char *buf, int sz)
 {
 	int off;
@@ -178,17 +180,6 @@ static int read_all(int fd, char *buf, int sz)
 	return off;
 }
 
-static int gl_cached = 0;
-static unsigned long text_base = 0;
-static const char *gl_cached_name = NULL;
-static unsigned long gl_cached_base = 0;
-static const char *soname = NULL;
-
-#define LONG_MAX 0x7fffFFFFffffFFFF
-#define ULONG_MAX 0xffffFFFFffffFFFFu
-#define AT_FDCWD (-100)
-#define SYS_OPENAT 0x101
-
 static long sys_openat(long dirfd, const void *restrict pathname, long flags, int *restrict result)
 {
 	unn_syscall_result rax;
@@ -208,7 +199,8 @@ static long sys_openat(long dirfd, const void *restrict pathname, long flags, in
 		dirfd_ul = (unsigned long)dirfd;
 	}
 
-	syscall3(dirfd_ul, (unsigned long)pathname, (unsigned long)(long)flags, SYS_OPENAT, &rax);
+	/* TODO: AArch64 */
+	syscall3(dirfd_ul, (unsigned long)pathname, (unsigned long)(long)flags, 0x101, &rax);
 	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
 		return rax.l;
 	}
@@ -243,8 +235,6 @@ static void syscall1(unsigned long a1, unsigned long n, unn_syscall_result *res)
 	asm volatile("syscall" : "=a"(*res) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
 }
 
-#define SYS_CLOSE 0x03
-
 static long sys_close(long fd)
 {
 	unn_syscall_result rax;
@@ -257,7 +247,7 @@ static long sys_close(long fd)
 	ASSERT(fd != STDERR_FILENO);
 #endif
 
-	syscall1((unsigned long)(long)fd, SYS_CLOSE, &rax);
+	syscall1((unsigned long)(long)fd, 0x03, &rax);
 	if (RARELY(rax.l < 0 && rax.l > -0x1000)) {
 		return rax.l;
 	}
@@ -271,9 +261,6 @@ static long sys_close(long fd)
 	ASSERT(rax.l == 0);
 	return rax.l;
 }
-
-#define MAPS_PATH "/proc/self/maps"
-#define O_RDONLY 0x0
 
 static char *z_strstr(const char *h, const char *n)
 {
@@ -362,7 +349,7 @@ static long find_libc_base(void)
 	}
 
 	int fd;
-	if (0 > (res = sys_openat(AT_FDCWD, MAPS_PATH, O_RDONLY, &fd))) {
+	if (0 > (res = sys_openat(AT_FDCWD, "/proc/self/maps", O_RDONLY, &fd))) {
 		return res;
 	}
 
@@ -414,32 +401,30 @@ static void *dyn_ptr(unsigned long base, unsigned long lo, unsigned long hi, uns
 	return vp.p;
 }
 
-#define PT_LOAD 1 /* Loadable program segment */
-#define DT_NULL 0	       /* Marks end of dynamic section */
-#define PT_DYNAMIC 2	       /* Dynamic linking information */
-#define DT_STRTAB 5	       /* Address of string table */
-#define DT_SYMTAB 6	       /* Address of symbol table */
-#define DT_HASH 4	       /* Address of symbol hash table */
-#define DT_GNU_HASH 0x6ffffef5 /* GNU-style hash table.  */
-
-/* The versioning entry types.  The next are defined as part of the
-   GNU extension.  */
-#define DT_VERSYM 0x6ffffff0
-
 static int mod_init(mod_t *m, unsigned long base)
 {
+	const unsigned long dt_VERSYM =
+	    0x6ffffff0; /* The versioning entry types.  The next are defined as part of the GNU extension.  */
+	const unsigned long dt_STRTAB = 5;	      /* Address of string table */
+	const unsigned long dt_SYMTAB = 6;	      /* Address of symbol table */
+	const unsigned long dt_HASH = 4;	      /* Address of symbol hash table */
+	const unsigned long dt_GNU_HASH = 0x6ffffef5; /* GNU-style hash table.  */
+	const unsigned long dt_NULL = 0;	      /* Marks end of dynamic section */
+	const unsigned long pt_LOAD = 1;	      /* Loadable program segment */
+	const unsigned long pt_DYNAMIC = 2;	      /* Dynamic linking information */
+
 	m->base = base;
-	m->eh = (Elf_Ehdr *)base;
+	m->eh = (Elf64_Ehdr *)base;
 	if (RARELY(m->eh->e_ident[0] != 0x7f || m->eh->e_ident[1] != 'E' || m->eh->e_ident[2] != 'L' ||
 		   m->eh->e_ident[3] != 'F'))
 		return -1;
 
-	m->ph = (Elf_Phdr *)(base + m->eh->e_phoff);
+	m->ph = (Elf64_Phdr *)(base + m->eh->e_phoff);
 
 	unsigned long lo = ~0UL, hi = 0;
 	for (int i = 0; i < m->eh->e_phnum; i++) {
-		Elf_Phdr *ph = &m->ph[i];
-		if (ph->p_type == PT_LOAD) {
+		Elf64_Phdr *ph = &m->ph[i];
+		if (ph->p_type == pt_LOAD) {
 			unsigned long seg_lo = base + ph->p_vaddr;
 			unsigned long seg_hi = seg_lo + ph->p_memsz;
 			if (seg_lo < lo)
@@ -451,12 +436,12 @@ static int mod_init(mod_t *m, unsigned long base)
 
 	m->dyn = NULL;
 	for (int i = 0; i < m->eh->e_phnum; i++) {
-		if (m->ph[i].p_type == PT_DYNAMIC) {
+		if (m->ph[i].p_type == pt_DYNAMIC) {
 			unsigned long dyn_addr = base + m->ph[i].p_vaddr;
-			if (dyn_addr < lo || dyn_addr + sizeof(Elf_Dyn) > hi) {
+			if (dyn_addr < lo || dyn_addr + sizeof(Elf64_Dyn) > hi) {
 				return -1;
 			}
-			m->dyn = (Elf_Dyn *)dyn_addr;
+			m->dyn = (Elf64_Dyn *)dyn_addr;
 			break;
 		}
 	}
@@ -464,35 +449,35 @@ static int mod_init(mod_t *m, unsigned long base)
 		return -1;
 	}
 
-	for (Elf_Dyn *d = m->dyn; d->d_tag != DT_NULL; d++) {
+	for (Elf64_Dyn *d = m->dyn; d->d_tag != dt_NULL; d++) {
 		switch (d->d_tag) {
-		case DT_STRTAB:
+		case dt_STRTAB:
 			m->dynstr = (const char *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
 			break;
-		case DT_SYMTAB:
-			m->dynsym = (Elf_Sym *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case dt_SYMTAB:
+			m->dynsym = (Elf64_Sym *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
 			break;
-		case DT_HASH: {
-			uint32_t *h = (uint32_t *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case dt_HASH: {
+			unsigned int *h = (unsigned int *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
 			m->nbucket = h[0];
 			m->nchain = h[1];
 			m->buckets = h + 2;
 			m->chains = h + 2 + m->nbucket;
 			break;
 		}
-		case DT_GNU_HASH: {
-			uint32_t *gh = (uint32_t *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case dt_GNU_HASH: {
+			unsigned int *gh = (unsigned int *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
 			m->gnu_nbucket = gh[0];
 			m->gnu_symoffset = gh[1];
 			m->gnu_maskwords = gh[2];
 			m->gnu_shift2 = gh[3];
 			m->gnu_bloom = (unsigned long *)(gh + 4);
-			m->gnu_buckets = (uint32_t *)(m->gnu_bloom + m->gnu_maskwords);
-			m->gnu_chain = (uint32_t *)(m->gnu_buckets + m->gnu_nbucket);
+			m->gnu_buckets = (unsigned int *)(m->gnu_bloom + m->gnu_maskwords);
+			m->gnu_chain = (unsigned int *)(m->gnu_buckets + m->gnu_nbucket);
 			break;
 		}
-		case DT_VERSYM:
-			m->versym = (uint16_t *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case dt_VERSYM:
+			m->versym = (unsigned short *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
 			break;
 		default:
 			break;
@@ -502,9 +487,7 @@ static int mod_init(mod_t *m, unsigned long base)
 	return m->dynsym && m->dynstr ? 0 : -1;
 }
 
-#define size_t unsigned long
-
-static void *z_memset(void *s, int c, size_t n)
+static void *z_memset(void *s, int c, unsigned long n)
 {
 	unsigned char *p = s, *e = p + n;
 	while (p < e)
@@ -512,15 +495,15 @@ static void *z_memset(void *s, int c, size_t n)
 	return s;
 }
 
-static uint32_t gnu_hash_str(const char *s)
+static unsigned int gnu_hash_str(const char *s)
 {
-	uint32_t h = 5381;
+	unsigned int h = 5381;
 	for (unsigned char c; (c = *s++) != 0;)
 		h = (h * 33) + c;
 	return h;
 }
 
-static uint32_t u32_mod(uint32_t a, uint32_t m)
+static unsigned int u32_mod(unsigned int a, unsigned int m)
 {
 	if (m == 0) {
 		return 0;
@@ -538,24 +521,24 @@ static int z_strcmp(const char *a, const char *b)
 }
 
 /* GNU hash lookup */
-static Elf_Sym *lookup_gnu(mod_t *restrict m, const char *restrict name)
+static Elf64_Sym *lookup_gnu(mod_t *restrict m, const char *restrict name)
 {
 	if (!m->gnu_buckets)
 		return NULL;
-	uint32_t h = gnu_hash_str(name);
-	size_t bloom_idx = (h / (sizeof(unsigned long) * 8)) & (m->gnu_maskwords - 1);
+	unsigned int h = gnu_hash_str(name);
+	unsigned long bloom_idx = (h / (sizeof(unsigned long) * 8)) & (m->gnu_maskwords - 1);
 	unsigned long bitmask = (1UL << (h % (sizeof(unsigned long) * 8))) |
 				(1UL << ((h >> m->gnu_shift2) % (sizeof(unsigned long) * 8)));
 	if ((m->gnu_bloom[bloom_idx] & bitmask) != bitmask)
 		return NULL;
 
-	uint32_t idx = m->gnu_buckets[u32_mod(h, m->gnu_nbucket)];
+	unsigned int idx = m->gnu_buckets[u32_mod(h, m->gnu_nbucket)];
 	if (!idx)
 		return NULL;
 	for (;;) {
-		uint32_t hv = m->gnu_chain[idx - m->gnu_symoffset];
+		unsigned int hv = m->gnu_chain[idx - m->gnu_symoffset];
 		if ((hv | 1U) == (h | 1U)) {
-			Elf_Sym *sym = &m->dynsym[idx];
+			Elf64_Sym *sym = &m->dynsym[idx];
 			if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
 				return sym;
 		}
@@ -566,10 +549,10 @@ static Elf_Sym *lookup_gnu(mod_t *restrict m, const char *restrict name)
 	return NULL;
 }
 
-static uint32_t sysv_hash(const char *s)
+static unsigned int sysv_hash(const char *s)
 {
-	uint32_t h;
-	uint32_t g;
+	unsigned int h;
+	unsigned int g;
 
 	h = 0;
 	while (*s) {
@@ -583,28 +566,25 @@ static uint32_t sysv_hash(const char *s)
 }
 
 /* SysV hash lookup */
-static Elf_Sym *lookup_sysv(mod_t *restrict m, const char *restrict name)
+static Elf64_Sym *lookup_sysv(mod_t *restrict m, const char *restrict name)
 {
 	if (!m->buckets)
 		return NULL;
-	uint32_t h = sysv_hash(name);
-	for (uint32_t i = m->buckets[u32_mod(h, m->nbucket)]; i != 0; i = m->chains[i]) {
-		Elf_Sym *sym = &m->dynsym[i];
+	unsigned int h = sysv_hash(name);
+	for (unsigned int i = m->buckets[u32_mod(h, m->nbucket)]; i != 0; i = m->chains[i]) {
+		Elf64_Sym *sym = &m->dynsym[i];
 		if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
 			return sym;
 	}
 	return NULL;
 }
 
-#define ELF_ST_TYPE(i) ((i) & 0xF)
-#define STT_FUNC 2 /* Symbol is a code object */
-#define STT_GNU_IFUNC 10 /* Symbol is indirect code object */
-#define RTLD_NOW 0x0002
-#define SYS_EXIT 0x3c
-
 static void *resolve_sym(mod_t *restrict m, const char *restrict name)
 {
-	Elf_Sym *s = NULL;
+	Elf64_Sym *s = NULL;
+
+	const unsigned long stt_GNU_IFUNC = 10; /* Symbol is indirect code object */
+	const unsigned long stt_FUNC = 2;	/* Symbol is a code object */
 
 	if (!s) {
 		s = lookup_gnu(m, name);
@@ -615,7 +595,7 @@ static void *resolve_sym(mod_t *restrict m, const char *restrict name)
 	if (RARELY(!s)) {
 		return NULL;
 	}
-	if (RARELY(ELF_ST_TYPE(s->st_info) != STT_FUNC && ELF_ST_TYPE(s->st_info) != STT_GNU_IFUNC)) {
+	if (RARELY((s->st_info & 0xF) != stt_FUNC && (s->st_info & 0xF) != stt_GNU_IFUNC)) {
 		return NULL;
 	}
 	return (void *)(m->base + s->st_value);
@@ -624,7 +604,7 @@ static void *resolve_sym(mod_t *restrict m, const char *restrict name)
 static void sys_exit(int status)
 {
 	unn_syscall_result rax;
-	syscall1((long)status, SYS_EXIT, &rax);
+	syscall1((long)status, 0x3c, &rax);
 	(void)rax;
 }
 

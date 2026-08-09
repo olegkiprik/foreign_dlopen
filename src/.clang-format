@@ -1,0 +1,12 @@
+BasedOnStyle: LLVM
+IndentWidth: 8
+UseTab: Always
+ColumnLimit: 112
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: false
+IndentCaseLabels: false
+MaxEmptyLinesToKeep: 1
+InsertNewlineAtEOF: true
+KeepEmptyLinesAtEOF: true
+
