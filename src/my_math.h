@@ -1,28 +1,34 @@
 #if !defined(MY_MATH_H)
 #define MY_MATH_H
 
-extern double (*my_fabs)(double);
-extern double (*my_fmod)(double);
-extern double (*my_exp)(double);
-extern double (*my_log)(double);
-extern double (*my_log10)(double);
-extern double (*my_pow)(double, double);
-extern double (*my_sqrt)(double);
-extern double (*my_sin)(double);
-extern double (*my_cos)(double);
-extern double (*my_tan)(double);
-extern double (*my_asin)(double);
-extern double (*my_acos)(double);
-extern double (*my_atan)(double);
-extern double (*my_atan2)(double, double);
-extern double (*my_sinh)(double);
-extern double (*my_cosh)(double);
-extern double (*my_tanh)(double);
-extern double (*my_ceil)(double);
-extern double (*my_floor)(double);
-extern double (*my_frexp)(double);
-extern double (*my_ldexp)(double);
-extern double (*my_modf)(double);
+#if defined(FOREIGN_DLOPEN_STATIC)
+#define MY_VISIBILITY static
+#else
+#define MY_VISIBILITY extern
+#endif
+
+MY_VISIBILITY double (*my_fabs)(double);
+MY_VISIBILITY double (*my_fmod)(double);
+MY_VISIBILITY double (*my_exp)(double);
+MY_VISIBILITY double (*my_log)(double);
+MY_VISIBILITY double (*my_log10)(double);
+MY_VISIBILITY double (*my_pow)(double, double);
+MY_VISIBILITY double (*my_sqrt)(double);
+MY_VISIBILITY double (*my_sin)(double);
+MY_VISIBILITY double (*my_cos)(double);
+MY_VISIBILITY double (*my_tan)(double);
+MY_VISIBILITY double (*my_asin)(double);
+MY_VISIBILITY double (*my_acos)(double);
+MY_VISIBILITY double (*my_atan)(double);
+MY_VISIBILITY double (*my_atan2)(double, double);
+MY_VISIBILITY double (*my_sinh)(double);
+MY_VISIBILITY double (*my_cosh)(double);
+MY_VISIBILITY double (*my_tanh)(double);
+MY_VISIBILITY double (*my_ceil)(double);
+MY_VISIBILITY double (*my_floor)(double);
+MY_VISIBILITY double (*my_frexp)(double);
+MY_VISIBILITY double (*my_ldexp)(double);
+MY_VISIBILITY double (*my_modf)(double);
 
 static double fabs(double x)
 {

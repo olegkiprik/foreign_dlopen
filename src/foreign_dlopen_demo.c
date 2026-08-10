@@ -1,8 +1,6 @@
-#define EI_NIDENT (16)
+#define asm __asm__
 
-#define uint16_t unsigned short
-#define uint32_t unsigned int
-#define uint64_t unsigned long
+#define EI_NIDENT 16
 
 #define SYS_EXIT 0x3c
 #define SYS_READ 0x00
@@ -13,7 +11,6 @@
 #define SYS_MMAP 0x09
 
 #define LOAD_ERR ((unsigned long)-1)
-#define z_alloca __builtin_alloca
 #define Z_PROG 0
 #define PRIVATE __attribute__((visibility("hidden")))
 #define Z_INTERP 1
@@ -97,55 +94,46 @@
 #define OFTEN(x) (__builtin_expect_with_probability((x), 1, 0.9))
 #define RARELY(x) (__builtin_expect_with_probability((x), 0, 0.9))
 
-typedef uint16_t Elf64_Half;
-typedef uint32_t Elf64_Word;
-typedef uint64_t Elf64_Addr;
-typedef uint64_t Elf64_Off;
-typedef uint64_t Elf64_Xword;
-
 typedef struct {
 	unsigned char e_ident[EI_NIDENT]; /* Magic number and other info */
-	Elf64_Half e_type;		  /* Object file type */
-	Elf64_Half e_machine;		  /* Architecture */
-	Elf64_Word e_version;		  /* Object file version */
-	Elf64_Addr e_entry;		  /* Entry point virtual address */
-	Elf64_Off e_phoff;		  /* Program header table file offset */
-	Elf64_Off e_shoff;		  /* Section header table file offset */
-	Elf64_Word e_flags;		  /* Processor-specific flags */
-	Elf64_Half e_ehsize;		  /* ELF header size in bytes */
-	Elf64_Half e_phentsize;		  /* Program header table entry size */
-	Elf64_Half e_phnum;		  /* Program header table entry count */
-	Elf64_Half e_shentsize;		  /* Section header table entry size */
-	Elf64_Half e_shnum;		  /* Section header table entry count */
-	Elf64_Half e_shstrndx;		  /* Section header string table index */
+	unsigned short e_type;		  /* Object file type */
+	unsigned short e_machine;	  /* Architecture */
+	unsigned int e_version;		  /* Object file version */
+	unsigned long e_entry;		  /* Entry point virtual address */
+	unsigned long e_phoff;		  /* Program header table file offset */
+	unsigned long e_shoff;		  /* Section header table file offset */
+	unsigned int e_flags;		  /* Processor-specific flags */
+	unsigned short e_ehsize;	  /* ELF header size in bytes */
+	unsigned short e_phentsize;	  /* Program header table entry size */
+	unsigned short e_phnum;		  /* Program header table entry count */
+	unsigned short e_shentsize;	  /* Section header table entry size */
+	unsigned short e_shnum;		  /* Section header table entry count */
+	unsigned short e_shstrndx;	  /* Section header string table index */
 } Elf64_Ehdr;
 
 typedef struct {
-	Elf64_Word p_type;    /* Segment type */
-	Elf64_Word p_flags;   /* Segment flags */
-	Elf64_Off p_offset;   /* Segment file offset */
-	Elf64_Addr p_vaddr;   /* Segment virtual address */
-	Elf64_Addr p_paddr;   /* Segment physical address */
-	Elf64_Xword p_filesz; /* Segment size in file */
-	Elf64_Xword p_memsz;  /* Segment size in memory */
-	Elf64_Xword p_align;  /* Segment alignment */
+	unsigned int p_type;	/* Segment type */
+	unsigned int p_flags;	/* Segment flags */
+	unsigned long p_offset; /* Segment file offset */
+	unsigned long p_vaddr;	/* Segment virtual address */
+	unsigned long p_paddr;	/* Segment physical address */
+	unsigned long p_filesz; /* Segment size in file */
+	unsigned long p_memsz;	/* Segment size in memory */
+	unsigned long p_align;	/* Segment alignment */
 } Elf64_Phdr;
 
 typedef struct {
-	uint64_t a_type; /* Entry type */
-	union {
-		uint64_t a_val; /* Integer value */
-				/* We use to have pointer elements added here.  We cannot do that,
-				   though, since it does not work when using 32-bit definitions
-				   on 64-bit platforms and vice versa.  */
-	} a_un;
+	unsigned long a_type; /* Entry type */
+	unsigned long a_val;  /* Integer value */
+			      /* We use to have pointer elements added here.  We cannot do that,
+				 though, since it does not work when using 32-bit definitions
+				 on 64-bit platforms and vice versa.  */
 } Elf64_auxv_t;
 
-unsigned long g_interp_base = 0;
+void *gl_interp_base = 0;
 
-static unsigned long *entry_sp =
-    NULL;		     /* Original sp (i.e. pointer to executable params) passed to entry, if any. */
-static void (*x_fini)(void); /* External fini function that the caller can provide us. */
+static void *gl_entry_sp = NULL; /* Original sp (i.e. pointer to executable params) passed to entry, if any. */
+static void (*gl_x_fini)(void);	 /* External fini function that the caller can provide us. */
 
 static void sys_exit(int status);
 static long sys_openat(long dirfd, const void *restrict pathname, long flags, int *restrict result);
@@ -158,7 +146,7 @@ static long sys_mprotect(void *addr, size_t len, int prot);
 
 static void *z_memcpy(void *dest, const void *src, size_t n);
 
-__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char **argv);
+__attribute__((always_inline)) static int exec_elf(const char *file, int argc, void *argv);
 
 int main(int argc, char **argv)
 {
@@ -174,8 +162,7 @@ int main(int argc, char **argv)
 	targv[0] = app;
 	targv[1] = "x";
 
-	exec_elf(app, sizeof targv / sizeof *targv, targv);
-	sys_exit(0);
+	return exec_elf(app, sizeof targv / sizeof *targv, targv);
 }
 
 static int check_ehdr(Elf_Ehdr *ehdr);
@@ -191,60 +178,81 @@ typedef union unn_syscall_result_ {
 	void *p;
 } unn_syscall_result;
 
-__attribute__((always_inline)) static void exec_elf(const char *file, int argc, char **argv)
+__attribute__((always_inline)) static int exec_elf(const char *file, int argc, void *argv)
 {
-	Elf_Ehdr ehdrs[2], *ehdr = ehdrs;
-	Elf_Phdr *phdr, *iter;
+	Elf_Ehdr ehdrs[2];
+	Elf_Ehdr *ehdr;
+	Elf_Phdr *phdr;
+	Elf_Phdr *iter;
 	Elf_auxv_t *av;
-	char **env, **p, *elf_interp = NULL;
-	unsigned long *sp = entry_sp;
-	unsigned long base[2], entry[2];
+	void *p; /* char ** */
+	char *elf_interp;
+	void *sp;
+	unsigned long base[2];
+	unsigned long entry[2];
 	ssize_t sz;
-	int fd, i;
+	int fd;
+	int i;
 	long tmpres;
+	unn_syscall_result vp;
+	unsigned long argv_sz;
+	void *p1;
+	unsigned int sz1;
+	void *from;
 
-	{
-		unsigned long *p = sp;
-		/* argc */
-		p++;
-		/* argv */
-		while (*p++ != 0)
-			;
+	sp = gl_entry_sp;
+	elf_interp = NULL;
+	ehdr = ehdrs;
 
-		unsigned long *from = p;
-		/* env */
-		while (*p++ != 0)
-			;
-		/* aux vector */
-		while (*p++ != 0) {
-			p++;
-		}
-		p++;
+	/* argc */
+	p1 = sp;
 
-		unsigned long argv_sz = argc * sizeof(*p);
-		unsigned sz = (char *)p - (char *)from;
-		p = __builtin_alloca(sizeof(*p) + argv_sz + sz); /* alloca */
-		*p = argc;
-		z_memcpy(p + 1, argv, argv_sz);
-		z_memcpy((char *)(p + 1) + argv_sz, from, sz);
-		sp = p;
-		argv = (char **)sp + 1;
+	/* argv */
+	p1 = (char *)p1 + 8;
+	while (*(char **)p1 != NULL) {
+		p1 = (char *)p1 + 8;
 	}
+	p1 = (char *)p1 + 8;
 
-	env = p = (char **)&argv[argc + 1];
-	while (*p++ != NULL)
-		;
-	av = (void *)p;
+	from = p1;
 
-	(void)env;
+	/* env */
+	while (*(void **)p1 != NULL) {
+		p1 = (char *)p1 + 8;
+	}
+	p1 = (char *)p1 + 8;
 
-	for (i = 0;; i++, ehdr++) {
+	/* aux vector */
+	while (*(void **)p1 != NULL) {
+		p1 = (char *)p1 + 16;
+	}
+	p1 = (char *)p1 + 16;
+
+	argv_sz = argc * 8ull;
+	sz1 = (char *)p1 - (char *)from;
+	p1 = __builtin_alloca(8ull + argv_sz + sz1);
+	*(unsigned long *)p1 = argc;
+	z_memcpy((char *)p1 + 8, argv, argv_sz);
+	z_memcpy((char *)p1 + 8 + argv_sz, from, sz1);
+	sp = p1;
+	argv = (char *)sp + 8;
+	p = (char *)argv + 8ull * (argc + 1);
+
+	while (*(void **)p != NULL) {
+		p = (char *)p + 8;
+	}
+	p = (char *)p + 8;
+
+	av = (Elf64_auxv_t *)p;
+
+	i = 0;
+	while (1 == 1) {
 		/* Open file, read and than check ELF header.*/
 		if (RARELY(0 > sys_openat(AT_FDCWD, file, O_RDONLY, &fd))) {
 			goto l_exit_failure;
 		}
 
-		if (RARELY(0 > sys_read(fd, ehdr, sizeof *ehdr, &tmpres) || tmpres != sizeof *ehdr)) {
+		if (RARELY(0 > sys_read(fd, ehdr, sizeof *ehdr, &tmpres) || tmpres != (long)sizeof *ehdr)) {
 			goto l_exit_failure;
 		}
 
@@ -253,7 +261,7 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 
 		/* Read the program header. */
 		sz = ehdr->e_phnum * sizeof(Elf_Phdr);
-		phdr = z_alloca(sz);
+		phdr = __builtin_alloca(sz);
 
 		if (RARELY(0 > sys_lseek(fd, ehdr->e_phoff, SEEK_SET, NULL))) {
 			goto l_exit_failure;
@@ -264,18 +272,24 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 		}
 
 		/* Time to load ELF. */
-		if (RARELY((base[i] = loadelf_anon(fd, ehdr, phdr)) == LOAD_ERR))
+		if (RARELY((base[i] = loadelf_anon(fd, ehdr, phdr)) == LOAD_ERR)) {
 			goto l_exit_failure;
+		}
 
 		/* Set the entry point, if the file is dynamic than add bias. */
 		entry[i] = ehdr->e_entry + (ehdr->e_type == ET_DYN ? base[i] : 0);
+
 		/* The second round, we've loaded ELF interp. */
-		if (file == elf_interp)
+		if (file == elf_interp) {
 			break;
-		for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
-			if (iter->p_type != PT_INTERP)
+		}
+
+		for (iter = phdr; iter < phdr + ehdr->e_phnum; ++iter) {
+			if (iter->p_type != PT_INTERP) {
 				continue;
-			elf_interp = z_alloca(iter->p_filesz);
+			}
+
+			elf_interp = __builtin_alloca(iter->p_filesz);
 
 			if (RARELY(0 > sys_lseek(fd, iter->p_offset, SEEK_SET, NULL))) {
 				goto l_exit_failure;
@@ -286,14 +300,20 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 				goto l_exit_failure;
 			}
 
-			if (RARELY(elf_interp[iter->p_filesz - 1] != '\0'))
+			if (RARELY(elf_interp[iter->p_filesz - 1] != '\0')) {
 				goto l_exit_failure;
-			// z_printf("elf_interp: %s\n", elf_interp);
+			}
+
 			file = elf_interp;
 		}
+
 		/* Looks like the ELF is static -- leave the loop. */
-		if (elf_interp == NULL)
+		if (elf_interp == NULL) {
 			break;
+		}
+
+		++i;
+		++ehdr;
 	}
 
 	/* Reassign some vectors that are important for
@@ -301,109 +321,134 @@ __attribute__((always_inline)) static void exec_elf(const char *file, int argc, 
 	while (av->a_type != AT_NULL) {
 		switch (av->a_type) {
 		case AT_PHDR:
-			av->a_un.a_val = base[Z_PROG] + ehdrs[Z_PROG].e_phoff;
+			av->a_val = base[Z_PROG] + ehdrs[Z_PROG].e_phoff;
 			break;
 		case AT_PHNUM:
-			av->a_un.a_val = ehdrs[Z_PROG].e_phnum;
+			av->a_val = ehdrs[Z_PROG].e_phnum;
 			break;
 		case AT_PHENT:
-			av->a_un.a_val = ehdrs[Z_PROG].e_phentsize;
+			av->a_val = ehdrs[Z_PROG].e_phentsize;
 			break;
 		case AT_ENTRY:
-			av->a_un.a_val = (unsigned long)z_fdl_entry;
+			av->a_val = (unsigned long)z_fdl_entry;
 			break;
 		case AT_EXECFN:
-			av->a_un.a_val = (unsigned long)argv[1];
+			av->a_val = (unsigned long)((char **)argv)[1];
 			break;
 		case AT_BASE:
-			av->a_un.a_val = elf_interp ? base[Z_INTERP] : av->a_un.a_val;
+			av->a_val = elf_interp ? base[Z_INTERP] : av->a_val;
+			break;
+		default:
 			break;
 		}
 		++av;
 	}
-
 	++av;
 
 	if (elf_interp) {
-		g_interp_base = base[Z_INTERP];
+		vp.ul = base[Z_INTERP];
+		gl_interp_base = vp.p;
 	}
 
-	unn_syscall_result vp;
-	vp.ul = elf_interp ? entry[Z_INTERP] : entry[Z_PROG];
+	vp.ul = elf_interp != NULL ? entry[Z_INTERP] : entry[Z_PROG];
 
-	z_trampo(vp.p, sp, z_fini);
+	z_trampo((void (*)(void))vp.p, sp, z_fini);
 
 	__builtin_unreachable();
 
 l_exit_failure:
-	sys_exit(1);
+	return 1;
 }
 
 static void z_fini(void)
 {
-	if (x_fini != NULL)
-		(*x_fini)();
+	if (gl_x_fini != NULL) {
+		(*gl_x_fini)();
+	}
 }
 
 static int check_ehdr(Elf_Ehdr *ehdr)
 {
-	unsigned char *e_ident = ehdr->e_ident;
-	return (e_ident[EI_MAG0] != ELFMAG0 || e_ident[EI_MAG1] != ELFMAG1 || e_ident[EI_MAG2] != ELFMAG2 ||
-		e_ident[EI_MAG3] != ELFMAG3 || e_ident[EI_CLASS] != ELFCLASS ||
-		e_ident[EI_VERSION] != EV_CURRENT || (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN))
+	const unsigned char *e_ident;
+
+	e_ident = ehdr->e_ident;
+	return (unsigned int)(e_ident[EI_MAG0] != ELFMAG0) | (unsigned int)(e_ident[EI_MAG1] != ELFMAG1) |
+		       (unsigned int)(e_ident[EI_MAG2] != ELFMAG2) |
+		       (unsigned int)(e_ident[EI_MAG3] != ELFMAG3) |
+		       (unsigned int)(e_ident[EI_CLASS] != ELFCLASS) |
+		       (unsigned int)(e_ident[EI_VERSION] != EV_CURRENT) |
+		       (unsigned int)(ehdr->e_type != ET_EXEC) & (unsigned int)(ehdr->e_type != ET_DYN)
 		   ? 0
 		   : 1;
 }
 
 static unsigned long loadelf_anon(int fd, Elf_Ehdr *restrict ehdr, Elf_Phdr *restrict phdr)
 {
-	unsigned long minva, maxva;
-	Elf_Phdr *iter;
+	unsigned long minva;
+	unsigned long maxva;
 	ssize_t sz;
-	int flags, dyn = ehdr->e_type == ET_DYN;
-	unsigned char *p, *base, *hint;
-	void *tmp;
+	int flags;
+	int dyn;
 	long tmpres;
+	unsigned long off;
+	void *start;
+	unn_syscall_result vp;
 
-	minva = (unsigned long)-1;
+	Elf_Phdr *iter;
+	char *p;
+	char *base;
+	char *hint;
+	void *tmp;
+
+	dyn = (ehdr->e_type == ET_DYN);
+
+	minva = 0xffffFFFFffffFFFF;
 	maxva = 0;
 
-	for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
-		if (iter->p_type != PT_LOAD)
+	for (iter = phdr; iter != phdr + ehdr->e_phnum; ++iter) {
+		if (iter->p_type != PT_LOAD) {
 			continue;
-		if (iter->p_vaddr < minva)
+		}
+		if (iter->p_vaddr < minva) {
 			minva = iter->p_vaddr;
-		if (iter->p_vaddr + iter->p_memsz > maxva)
+		}
+		if (iter->p_vaddr + iter->p_memsz > maxva) {
 			maxva = iter->p_vaddr + iter->p_memsz;
+		}
 	}
 
 	minva = TRUNC_PG(minva);
 	maxva = ROUND_PG(maxva);
 
-	/* For dynamic ELF let the kernel chose the address. */
-	hint = dyn ? NULL : (void *)minva;
+	vp.ul = minva;
+
+	/* For dynamic ELF let the kernel choose the address. */
+	hint = dyn ? NULL : vp.p;
 	flags = dyn ? 0 : MAP_FIXED;
-	flags |= (MAP_PRIVATE | MAP_ANONYMOUS);
+	flags |= MAP_PRIVATE | MAP_ANONYMOUS;
 
 	/* Check that we can hold the whole image. */
 	if (RARELY(0 > sys_mmap(hint, maxva - minva, PROT_NONE, flags, -1, 0, &tmp))) {
 		return -1;
 	}
 	base = tmp;
+
 	(void)sys_munmap(base, maxva - minva);
 
 	flags = MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE;
+
 	/* Now map each segment separately in precalculated address. */
-	for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++) {
-		unsigned long off, start;
-		if (iter->p_type != PT_LOAD)
+	for (iter = phdr; iter != phdr + ehdr->e_phnum; ++iter) {
+		if (iter->p_type != PT_LOAD) {
 			continue;
+		}
+
 		off = iter->p_vaddr & ALIGN;
-		start = dyn ? (unsigned long)base : 0;
-		start += TRUNC_PG(iter->p_vaddr);
+		start = dyn ? base : NULL;
+		start = (char *)start + TRUNC_PG(iter->p_vaddr);
 		sz = ROUND_PG(iter->p_memsz + off);
 
-		if (RARELY(0 > sys_mmap((void *)start, sz, PROT_READ | PROT_WRITE, flags, -1, 0, &tmp))) {
+		if (RARELY(0 > sys_mmap(start, sz, PROT_READ | PROT_WRITE, flags, -1, 0, &tmp))) {
 			goto err;
 		}
 		p = tmp;
@@ -426,16 +471,17 @@ err:
 	return LOAD_ERR;
 }
 
-void z_entry(unsigned long *restrict sp, void (*fini)(void))
+void z_entry(void *restrict sp, void (*fini)(void))
 {
 	int argc;
 	char **argv;
 
-	entry_sp = sp;
-	x_fini = fini;
-	argc = (int)*(sp);
-	argv = (char **)(sp + 1);
-	main(argc, argv);
+	gl_entry_sp = sp;
+	gl_x_fini = fini;
+
+	argc = (int)*(unsigned long *)sp;
+	argv = (char **)((char *)sp + 8ull);
+	sys_exit(main(argc, argv));
 }
 
 static void syscall1(unsigned long a1, unsigned long n, unn_syscall_result *res)
@@ -674,9 +720,19 @@ static long sys_openat(long dirfd, const void *restrict pathname, long flags, in
 
 static void *z_memcpy(void *dest, const void *src, size_t n)
 {
-	unsigned char *d = dest;
-	const unsigned char *p = src, *e = p + n;
-	while (p < e)
-		*d++ = *p++;
+	char *d;
+	const char *p;
+	const char *e;
+
+	d = dest;
+	p = src;
+	e = p + n;
+
+	while (p < e) {
+		*d = *p;
+		++d;
+		++p;
+	}
+
 	return dest;
 }

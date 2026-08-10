@@ -1,5 +1,14 @@
 
+#define FOREIGN_DLOPEN_STATIC
+#include "my_dlfcn.h"
+#include "my_math.h"
+#include "my_pthread.h"
+#undef MY_VISIBILITY
+
+/* put single-header libraries here, without standard library #include */
+
 /* custom macros */
+#define asm __asm__
 #define RARELY(x) (__builtin_expect_with_probability((x), 0, 0.9))
 #define OFTEN(x) (__builtin_expect_with_probability((x), 1, 0.9))
 #define ASSERT(x)                                                                                              \
@@ -66,11 +75,8 @@ typedef struct {
 } Elf64_Phdr;
 
 typedef struct {
-	long d_tag; /* Dynamic entry type */
-	union {
-		unsigned long d_val; /* Integer value */
-		unsigned long d_ptr; /* Address value */
-	} d_un;
+	long d_tag;		 /* Dynamic entry type */
+	unsigned long d_ptr_val; /* Address or integer value */
 } Elf64_Dyn;
 
 typedef struct {
@@ -88,18 +94,20 @@ typedef struct {
 	Elf64_Phdr *ph;
 	Elf64_Dyn *dyn;
 	unsigned long base;
-	unsigned long nbucket, nchain;
-	unsigned int *buckets, *chains;
+	unsigned long nbucket;
+	unsigned long nchain;
+	unsigned int *buckets;
+	unsigned int *chains;
 	unsigned int *gnu_buckets;
 	unsigned int *gnu_chain;
 	unsigned int gnu_maskwords;
 	unsigned int gnu_shift2;
-	unsigned long *gnu_bloom;
+	unsigned int *gnu_bloom; /* unsigned long, but effective type is unsigned int */
 	unsigned int gnu_nbucket;
 	unsigned int gnu_symoffset;
 	Elf64_Sym *dynsym;
 	const char *dynstr;
-	unsigned short *versym;
+	void *versym; /* unsigned short */
 } mod_t;
 
 typedef union unn_syscall_result_ {
@@ -108,11 +116,10 @@ typedef union unn_syscall_result_ {
 	void *p;
 } unn_syscall_result;
 
-static int gl_cached = 0;
-static unsigned long text_base = 0;
-static const char *gl_cached_name = NULL;
-static unsigned long gl_cached_base = 0;
-static const char *soname = NULL;
+static void syscall1(unsigned long a1, unsigned long n, unn_syscall_result *res)
+{
+	asm volatile("syscall" : "=a"(*res) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
+}
 
 static void syscall3(unsigned long a1, unsigned long a2, unsigned long a3, unsigned long n,
 		     unn_syscall_result *res)
@@ -151,33 +158,6 @@ static long sys_read(long fd, void *restrict buf, unsigned long nbytes, long *re
 		*result = rax.l;
 	}
 	return rax.l;
-}
-
-static int read_all(int fd, char *buf, int sz)
-{
-	int off;
-	int n;
-	long tmpres;
-
-	off = 0;
-	while (1) {
-		if (off >= sz) {
-			break;
-		}
-
-		if (0 > sys_read(fd, buf + off, sz - off, &tmpres)) {
-			break;
-		}
-
-		if (tmpres <= 0) {
-			break;
-		}
-
-		n = tmpres;
-		off += n;
-	}
-
-	return off;
 }
 
 static long sys_openat(long dirfd, const void *restrict pathname, long flags, int *restrict result)
@@ -230,11 +210,6 @@ static long sys_openat(long dirfd, const void *restrict pathname, long flags, in
 	return rax.l;
 }
 
-static void syscall1(unsigned long a1, unsigned long n, unn_syscall_result *res)
-{
-	asm volatile("syscall" : "=a"(*res) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
-}
-
 static long sys_close(long fd)
 {
 	unn_syscall_result rax;
@@ -262,18 +237,54 @@ static long sys_close(long fd)
 	return rax.l;
 }
 
-static char *z_strstr(const char *h, const char *n)
+static void sys_exit(int status)
 {
-	if (!*n)
-		return (char *)h;
-	for (; *h; h++) {
-		const char *p = h, *q = n;
-		while (*p && *q && *p == *q) {
-			p++;
-			q++;
+	unn_syscall_result rax;
+	syscall1((long)status, 0x3c, &rax);
+	(void)rax;
+}
+
+static int read_all(int fd, char *buf, int sz)
+{
+	int off;
+	int n;
+	long tmpres;
+
+	off = 0;
+	while (1) {
+		if (off >= sz) {
+			break;
 		}
-		if (!*q)
-			return (char *)h;
+
+		if (0 > sys_read(fd, buf + off, sz - off, &tmpres) || tmpres <= 0) {
+			break;
+		}
+
+		n = tmpres;
+		off += n;
+	}
+
+	return off;
+}
+
+static const char *z_strstr(const char *h, const char *n)
+{
+	const char *p;
+	const char *q;
+
+	if (*n == '\0') {
+		return h;
+	}
+	for (; *h != '\0'; ++h) {
+		p = h;
+		q = n;
+		while ((unsigned int)(*p != '\0') & (unsigned int)(*q != '\0') & (unsigned int)(*p == *q)) {
+			++p;
+			++q;
+		}
+		if (*q == '\0') {
+			return h;
+		}
 	}
 	return NULL;
 }
@@ -291,46 +302,67 @@ static int parse_maps_line(const char *line, unsigned long *start, char *perms_o
 
 	/* start */
 	v = 0;
-	for (; *p >= '0' && *p <= '9' || *p >= 'a' && *p <= 'f' || *p >= 'A' && *p <= 'F'; p++)
+	while ((unsigned int)(*p >= '0') & (unsigned int)(*p <= '9') |
+	       (unsigned int)(*p >= 'a') & (unsigned int)(*p <= 'f') |
+	       (unsigned int)(*p >= 'A') & (unsigned int)(*p <= 'F')) {
 		v = v << 4 | (unsigned long)(*p <= '9' ? *p - '0' : *p >= 'a' ? 10 + *p - 'a' : 10 + *p - 'A');
-	if (RARELY(*p != '-'))
+		++p;
+	}
+	if (*p != '-') {
 		return -1;
+	}
 	*start = v;
-	p++;
+	++p;
 
 	/* end (skip) */
-	for (; *p >= '0' && *p <= '9' || *p >= 'a' && *p <= 'f' || *p >= 'A' && *p <= 'F'; p++)
-		;
-	while (*p == ' ')
-		p++;
+	while ((unsigned int)(*p >= '0') & (unsigned int)(*p <= '9') |
+	       (unsigned int)(*p >= 'a') & (unsigned int)(*p <= 'f') |
+	       (unsigned int)(*p >= 'A') & (unsigned int)(*p <= 'F')) {
+		++p;
+	}
+	while (*p == ' ') {
+		++p;
+	}
 
 	/* perms (4 chars) */
-	for (i = 0; i < 4; i++) {
-		if (RARELY(!p[i]))
+	for (i = 0; i < 4; ++i) {
+		if (p[i] == '\0') {
 			return -1;
+		}
 		perms_out[i] = p[i];
 	}
+
 	perms_out[4] = 0;
 	p += 4;
-	while (*p == ' ')
-		p++;
+	while (*p == ' ') {
+		++p;
+	}
 
 	/* offset */
 	v = 0;
-	for (; *p >= '0' && *p <= '9' || *p >= 'a' && *p <= 'f' || *p >= 'A' && *p <= 'F'; p++)
+	while ((unsigned int)(*p >= '0') & (unsigned int)(*p <= '9') |
+	       (unsigned int)(*p >= 'a') & (unsigned int)(*p <= 'f') |
+	       (unsigned int)(*p >= 'A') & (unsigned int)(*p <= 'F')) {
 		v = v << 4 | (unsigned long)(*p <= '9' ? *p - '0' : *p >= 'a' ? 10 + *p - 'a' : 10 + *p - 'A');
+		++p;
+	}
 	*offset = v;
 
 	/* skip dev */
-	while (*p && *p != ' ')
-		p++;
-	while (*p == ' ')
-		p++;
+	while ((unsigned int)(*p != '\0') & (unsigned int)(*p != ' ')) {
+		++p;
+	}
+	while (*p == ' ') {
+		++p;
+	}
+
 	/* skip inode */
-	while (*p && *p != ' ')
-		p++;
-	while (*p == ' ')
-		p++;
+	while ((unsigned int)(*p != '\0') & (unsigned int)(*p != ' ')) {
+		++p;
+	}
+	while (*p == ' ') {
+		++p;
+	}
 
 	/* path (may be empty) */
 	*path_out = *p != '\0' ? p : NULL;
@@ -338,107 +370,144 @@ static int parse_maps_line(const char *line, unsigned long *start, char *perms_o
 }
 
 /* Parse /proc/self/maps to find libc mapping with offset 0 */
-static long find_libc_base(void)
+static long find_libc_base(int *restrict cached, void **restrict text_base, const char **restrict cached_name,
+			   void **restrict cached_base, const char **restrict soname)
 {
 	long res;
+	int fd;
+	char buf[65536];
+	int n;
+	char *p;
+	char *line;
+	char save;
+	unsigned long start;
+	unsigned long off;
+	char perms[5];
+	const char *path;
+	unn_syscall_result vp;
 
-	if (gl_cached) {
-		text_base = gl_cached_base;
-		soname = gl_cached_name;
+	if (*cached) {
+		*text_base = *cached_base;
+		*soname = *cached_name;
 		return 0;
 	}
 
-	int fd;
 	if (0 > (res = sys_openat(AT_FDCWD, "/proc/self/maps", O_RDONLY, &fd))) {
 		return res;
 	}
 
-	char buf[65536];
-	int n = read_all(fd, buf, sizeof(buf) - 1);
+	n = read_all(fd, buf, sizeof buf - 1);
 	(void)sys_close(fd);
-	if (n <= 0)
+
+	if (n <= 0) {
 		return -1;
+	}
+
 	buf[n] = 0;
-	char *p = buf;
-	while (*p) {
-		char *line = p;
-		while (*p && *p != '\n')
-			p++;
-		char save = *p;
+	p = buf;
+
+	while (*p != '\0') {
+		line = p;
+		while ((unsigned int)(*p != '\0') & (unsigned int)(*p != '\n')) {
+			++p;
+		}
+		save = *p;
 		*p = 0;
 
-		unsigned long start = 0, off = 0;
-		char perms[5];
-		const char *path = NULL;
-		if (z_strstr(line, "libc")) {
-			if (parse_maps_line(line, &start, perms, &off, &path) == 0 && path && off == 0) {
-				text_base = start;
-				soname = path;
-				gl_cached = 1;
-				gl_cached_base = text_base;
-				gl_cached_name = soname;
+		start = 0;
+		off = 0;
+		path = NULL;
+		if (NULL != z_strstr(line, "libc")) {
+			if (0 == parse_maps_line(line, &start, perms, &off, &path) &&
+			    ((unsigned int)(path != NULL) & (unsigned int)(off == 0))) {
+				vp.ul = start;
+				*text_base = vp.p;
+				*soname = path;
+				*cached = 1;
+				*cached_base = *text_base;
+				*cached_name = *soname;
 				*p = save;
 				return 0;
 			}
 		}
 
 		*p = save;
-		if (*p)
-			p++;
+		if (*p != '\0') {
+			++p;
+		}
 	}
 	return -1;
 }
 
 /* helper: turn a DT_* pointer/offset into an absolute VA */
-static void *dyn_ptr(unsigned long base, unsigned long lo, unsigned long hi, unsigned long p)
+static void *dyn_ptr(void *base, unsigned long lo, unsigned long hi, unsigned long p)
 {
 	unn_syscall_result vp;
 
 	vp.ul = p;
 	/* if it's not already inside this module's mapped range, treat as offset */
-	if (vp.ul < lo || vp.ul >= hi)
-		vp.ul += base;
+	if ((unsigned int)(vp.ul < lo) | (unsigned int)(vp.ul >= hi)) {
+		vp.ul += (unsigned long)base;
+	}
 	return vp.p;
 }
 
-static int mod_init(mod_t *m, unsigned long base)
+#if defined(DT_STRTAB) || defined(DT_SYMTAB) || defined(DT_HASH) || defined(DT_GNU_HASH) || defined(DT_VERSYM)
+#error "!"
+#endif
+
+#define DT_STRTAB 5	       /* Address of string table */
+#define DT_SYMTAB 6	       /* Address of symbol table */
+#define DT_HASH 4	       /* Address of symbol hash table */
+#define DT_GNU_HASH 0x6ffffef5 /* GNU-style hash table.  */
+#define DT_VERSYM                                                                                              \
+	0x6ffffff0 /* The versioning entry types.  The next are defined as part of the GNU extension.  */
+
+static int mod_init(mod_t *restrict m, void *restrict base)
 {
-	const unsigned long dt_VERSYM =
-	    0x6ffffff0; /* The versioning entry types.  The next are defined as part of the GNU extension.  */
-	const unsigned long dt_STRTAB = 5;	      /* Address of string table */
-	const unsigned long dt_SYMTAB = 6;	      /* Address of symbol table */
-	const unsigned long dt_HASH = 4;	      /* Address of symbol hash table */
-	const unsigned long dt_GNU_HASH = 0x6ffffef5; /* GNU-style hash table.  */
-	const unsigned long dt_NULL = 0;	      /* Marks end of dynamic section */
-	const unsigned long pt_LOAD = 1;	      /* Loadable program segment */
-	const unsigned long pt_DYNAMIC = 2;	      /* Dynamic linking information */
+	const unsigned long dt_NULL = 0;    /* Marks end of dynamic section */
+	const unsigned long pt_LOAD = 1;    /* Loadable program segment */
+	const unsigned long pt_DYNAMIC = 2; /* Dynamic linking information */
+	unsigned int *h;
+	unsigned int *gh;
+	unsigned long lo;
+	unsigned long hi;
+	unsigned long seg_lo;
+	unsigned long seg_hi;
+	void *dyn_addr;
+	int i;
 
-	m->base = base;
+	m->base = (unsigned long)base;
 	m->eh = (Elf64_Ehdr *)base;
-	if (RARELY(m->eh->e_ident[0] != 0x7f || m->eh->e_ident[1] != 'E' || m->eh->e_ident[2] != 'L' ||
-		   m->eh->e_ident[3] != 'F'))
+	if (RARELY((unsigned int)(m->eh->e_ident[0] != 0x7f) | (unsigned int)(m->eh->e_ident[1] != 'E') |
+		   (unsigned int)(m->eh->e_ident[2] != 'L') | (unsigned int)(m->eh->e_ident[3] != 'F'))) {
 		return -1;
+	}
 
-	m->ph = (Elf64_Phdr *)(base + m->eh->e_phoff);
+	m->ph = (Elf64_Phdr *)((char *)base + m->eh->e_phoff);
 
-	unsigned long lo = ~0UL, hi = 0;
-	for (int i = 0; i < m->eh->e_phnum; i++) {
+	lo = ~0UL;
+	hi = 0;
+	for (i = 0; i < m->eh->e_phnum; ++i) {
 		Elf64_Phdr *ph = &m->ph[i];
 		if (ph->p_type == pt_LOAD) {
-			unsigned long seg_lo = base + ph->p_vaddr;
-			unsigned long seg_hi = seg_lo + ph->p_memsz;
-			if (seg_lo < lo)
+			seg_lo = (unsigned long)base + ph->p_vaddr;
+			seg_hi = (unsigned long)seg_lo + ph->p_memsz;
+			if (seg_lo < lo) {
 				lo = seg_lo;
-			if (seg_hi > hi)
+			}
+			if (seg_hi > hi) {
 				hi = seg_hi;
+			}
 		}
 	}
 
 	m->dyn = NULL;
-	for (int i = 0; i < m->eh->e_phnum; i++) {
+	for (i = 0; i < m->eh->e_phnum; ++i) {
 		if (m->ph[i].p_type == pt_DYNAMIC) {
-			unsigned long dyn_addr = base + m->ph[i].p_vaddr;
-			if (dyn_addr < lo || dyn_addr + sizeof(Elf64_Dyn) > hi) {
+			dyn_addr = (char *)base + m->ph[i].p_vaddr;
+			if ((unsigned int)((unsigned long)dyn_addr < lo) |
+			    (unsigned int)((unsigned long)dyn_addr + sizeof(Elf64_Dyn) > hi)) {
 				return -1;
 			}
 			m->dyn = (Elf64_Dyn *)dyn_addr;
@@ -449,57 +518,74 @@ static int mod_init(mod_t *m, unsigned long base)
 		return -1;
 	}
 
-	for (Elf64_Dyn *d = m->dyn; d->d_tag != dt_NULL; d++) {
+	for (Elf64_Dyn *d = m->dyn; d->d_tag != dt_NULL; ++d) {
 		switch (d->d_tag) {
-		case dt_STRTAB:
-			m->dynstr = (const char *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case DT_STRTAB:
+			m->dynstr = (const char *)dyn_ptr(base, lo, hi, d->d_ptr_val);
 			break;
-		case dt_SYMTAB:
-			m->dynsym = (Elf64_Sym *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case DT_SYMTAB:
+			m->dynsym = (Elf64_Sym *)dyn_ptr(base, lo, hi, d->d_ptr_val);
 			break;
-		case dt_HASH: {
-			unsigned int *h = (unsigned int *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case DT_HASH:
+			h = (unsigned int *)dyn_ptr(base, lo, hi, d->d_ptr_val);
 			m->nbucket = h[0];
 			m->nchain = h[1];
 			m->buckets = h + 2;
 			m->chains = h + 2 + m->nbucket;
 			break;
-		}
-		case dt_GNU_HASH: {
-			unsigned int *gh = (unsigned int *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case DT_GNU_HASH:
+			gh = (unsigned int *)dyn_ptr(base, lo, hi, d->d_ptr_val);
 			m->gnu_nbucket = gh[0];
 			m->gnu_symoffset = gh[1];
 			m->gnu_maskwords = gh[2];
 			m->gnu_shift2 = gh[3];
-			m->gnu_bloom = (unsigned long *)(gh + 4);
-			m->gnu_buckets = (unsigned int *)(m->gnu_bloom + m->gnu_maskwords);
-			m->gnu_chain = (unsigned int *)(m->gnu_buckets + m->gnu_nbucket);
+			m->gnu_bloom = gh + 4;
+			m->gnu_buckets = m->gnu_bloom + 2ull * m->gnu_maskwords;
+			m->gnu_chain = m->gnu_buckets + m->gnu_nbucket;
 			break;
-		}
-		case dt_VERSYM:
-			m->versym = (unsigned short *)dyn_ptr(base, lo, hi, (unsigned long)d->d_un.d_ptr);
+		case DT_VERSYM:
+			m->versym = dyn_ptr(base, lo, hi, d->d_ptr_val);
 			break;
 		default:
 			break;
 		}
 	}
 
-	return m->dynsym && m->dynstr ? 0 : -1;
+	return (unsigned long)(m->dynsym) & (unsigned long)(m->dynstr) ? 0 : -1;
 }
+
+#undef DT_STRTAB
+#undef DT_SYMTAB
+#undef DT_HASH
+#undef DT_GNU_HASH
+#undef DT_VERSYM
 
 static void *z_memset(void *s, int c, unsigned long n)
 {
 	unsigned char *p = s, *e = p + n;
-	while (p < e)
-		*p++ = c;
+	while (p < e) {
+		*p = c;
+		++p;
+	}
 	return s;
 }
 
 static unsigned int gnu_hash_str(const char *s)
 {
-	unsigned int h = 5381;
-	for (unsigned char c; (c = *s++) != 0;)
+	unsigned int h;
+	unsigned char c;
+
+	h = 5381;
+
+	while (1 == 1) {
+		c = *s;
+		++s;
+		if (c == 0) {
+			break;
+		}
 		h = (h * 33) + c;
+	}
+
 	return h;
 }
 
@@ -513,9 +599,9 @@ static unsigned int u32_mod(unsigned int a, unsigned int m)
 
 static int z_strcmp(const char *a, const char *b)
 {
-	while (*a && (*a == *b)) {
-		a++;
-		b++;
+	while ((unsigned int)(*a != '\0') & (unsigned int)(*a == *b)) {
+		++a;
+		++b;
 	}
 	return (unsigned char)*a - (unsigned char)*b;
 }
@@ -523,28 +609,47 @@ static int z_strcmp(const char *a, const char *b)
 /* GNU hash lookup */
 static Elf64_Sym *lookup_gnu(mod_t *restrict m, const char *restrict name)
 {
-	if (!m->gnu_buckets)
-		return NULL;
-	unsigned int h = gnu_hash_str(name);
-	unsigned long bloom_idx = (h / (sizeof(unsigned long) * 8)) & (m->gnu_maskwords - 1);
-	unsigned long bitmask = (1UL << (h % (sizeof(unsigned long) * 8))) |
-				(1UL << ((h >> m->gnu_shift2) % (sizeof(unsigned long) * 8)));
-	if ((m->gnu_bloom[bloom_idx] & bitmask) != bitmask)
-		return NULL;
+	unsigned int h;
+	unsigned long bloom_idx;
+	unsigned long bitmask;
+	unsigned long tmp;
+	unsigned int idx;
+	unsigned int hv;
+	Elf64_Sym *sym;
 
-	unsigned int idx = m->gnu_buckets[u32_mod(h, m->gnu_nbucket)];
-	if (!idx)
+	if (m->gnu_buckets == NULL) {
 		return NULL;
-	for (;;) {
-		unsigned int hv = m->gnu_chain[idx - m->gnu_symoffset];
-		if ((hv | 1U) == (h | 1U)) {
-			Elf64_Sym *sym = &m->dynsym[idx];
-			if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
+	}
+
+	h = gnu_hash_str(name);
+	bloom_idx = h / (sizeof(long) * 8) & m->gnu_maskwords - 1;
+	bitmask = 1ull << h % (sizeof(long) * 8) | 1ull << (h >> m->gnu_shift2) % (sizeof(long) * 8);
+
+	tmp = m->gnu_bloom[bloom_idx * 2 + 1];
+	tmp <<= 32;
+	tmp |= m->gnu_bloom[bloom_idx * 2];
+
+	if ((tmp & bitmask) != bitmask) {
+		return NULL;
+	}
+
+	idx = m->gnu_buckets[u32_mod(h, m->gnu_nbucket)];
+	if (!idx) {
+		return NULL;
+	}
+
+	while (1 == 1) {
+		hv = m->gnu_chain[idx - m->gnu_symoffset];
+		if ((hv | 1u) == (h | 1u)) {
+			sym = m->dynsym + idx;
+			if (sym->st_name != 0 && 0 == z_strcmp(m->dynstr + sym->st_name, name)) {
 				return sym;
+			}
 		}
-		if (hv & 1U)
+		if (hv & 1u) {
 			break;
-		idx++;
+		}
+		++idx;
 	}
 	return NULL;
 }
@@ -555,11 +660,13 @@ static unsigned int sysv_hash(const char *s)
 	unsigned int g;
 
 	h = 0;
-	while (*s) {
-		h = (h << 4) + (unsigned char)*s++;
+	while (*s != '\0') {
+		h = (h << 4) + (unsigned char)*s;
+		++s;
 		g = h & 0xF0000000U;
-		if (g)
+		if (g != 0) {
 			h ^= g >> 24;
+		}
 		h &= ~g;
 	}
 	return h;
@@ -568,106 +675,113 @@ static unsigned int sysv_hash(const char *s)
 /* SysV hash lookup */
 static Elf64_Sym *lookup_sysv(mod_t *restrict m, const char *restrict name)
 {
-	if (!m->buckets)
+	unsigned int i;
+	unsigned int h;
+	Elf64_Sym *sym;
+
+	if (!m->buckets) {
 		return NULL;
-	unsigned int h = sysv_hash(name);
-	for (unsigned int i = m->buckets[u32_mod(h, m->nbucket)]; i != 0; i = m->chains[i]) {
-		Elf64_Sym *sym = &m->dynsym[i];
-		if (sym->st_name && !z_strcmp(m->dynstr + sym->st_name, name))
+	}
+
+	h = sysv_hash(name);
+	for (i = m->buckets[u32_mod(h, m->nbucket)]; i != 0; i = m->chains[i]) {
+		sym = &m->dynsym[i];
+		if (sym->st_name != 0 && 0 == z_strcmp(m->dynstr + sym->st_name, name)) {
 			return sym;
+		}
 	}
 	return NULL;
 }
 
 static void *resolve_sym(mod_t *restrict m, const char *restrict name)
 {
-	Elf64_Sym *s = NULL;
-
+	Elf64_Sym *s;
+	unn_syscall_result vp;
 	const unsigned long stt_GNU_IFUNC = 10; /* Symbol is indirect code object */
 	const unsigned long stt_FUNC = 2;	/* Symbol is a code object */
 
-	if (!s) {
-		s = lookup_gnu(m, name);
-	}
-	if (!s) {
+	s = lookup_gnu(m, name);
+	if (s == NULL) {
 		s = lookup_sysv(m, name);
 	}
-	if (RARELY(!s)) {
+
+	if (RARELY(s == NULL)) {
 		return NULL;
 	}
-	if (RARELY((s->st_info & 0xF) != stt_FUNC && (s->st_info & 0xF) != stt_GNU_IFUNC)) {
+
+	if (RARELY((unsigned int)((s->st_info & 0xF) != stt_FUNC) &
+		   (unsigned int)((s->st_info & 0xF) != stt_GNU_IFUNC))) {
 		return NULL;
 	}
-	return (void *)(m->base + s->st_value);
+
+	vp.ul = m->base + s->st_value;
+	return vp.p;
 }
 
-static void sys_exit(int status)
-{
-	unn_syscall_result rax;
-	syscall1((long)status, 0x3c, &rax);
-	(void)rax;
-}
+#if defined(FOREIGN_DLOPEN_STATIC)
+#define MY_VISIBILITY static
+#else
+#define MY_VISIBILITY
+#endif
 
-double (*my_fabs)(double) = NULL;
-double (*my_fmod)(double) = NULL;
-double (*my_exp)(double) = NULL;
-double (*my_log)(double) = NULL;
-double (*my_log10)(double) = NULL;
-double (*my_pow)(double, double) = NULL;
-double (*my_sqrt)(double) = NULL;
-double (*my_sin)(double) = NULL;
-double (*my_cos)(double) = NULL;
-double (*my_tan)(double) = NULL;
-double (*my_asin)(double) = NULL;
-double (*my_acos)(double) = NULL;
-double (*my_atan)(double) = NULL;
-double (*my_atan2)(double, double) = NULL;
-double (*my_sinh)(double) = NULL;
-double (*my_cosh)(double) = NULL;
-double (*my_tanh)(double) = NULL;
-double (*my_ceil)(double) = NULL;
-double (*my_floor)(double) = NULL;
-double (*my_frexp)(double) = NULL;
-double (*my_ldexp)(double) = NULL;
-double (*my_modf)(double) = NULL;
+MY_VISIBILITY double (*my_fabs)(double) = NULL;
+MY_VISIBILITY double (*my_fmod)(double) = NULL;
+MY_VISIBILITY double (*my_exp)(double) = NULL;
+MY_VISIBILITY double (*my_log)(double) = NULL;
+MY_VISIBILITY double (*my_log10)(double) = NULL;
+MY_VISIBILITY double (*my_pow)(double, double) = NULL;
+MY_VISIBILITY double (*my_sqrt)(double) = NULL;
+MY_VISIBILITY double (*my_sin)(double) = NULL;
+MY_VISIBILITY double (*my_cos)(double) = NULL;
+MY_VISIBILITY double (*my_tan)(double) = NULL;
+MY_VISIBILITY double (*my_asin)(double) = NULL;
+MY_VISIBILITY double (*my_acos)(double) = NULL;
+MY_VISIBILITY double (*my_atan)(double) = NULL;
+MY_VISIBILITY double (*my_atan2)(double, double) = NULL;
+MY_VISIBILITY double (*my_sinh)(double) = NULL;
+MY_VISIBILITY double (*my_cosh)(double) = NULL;
+MY_VISIBILITY double (*my_tanh)(double) = NULL;
+MY_VISIBILITY double (*my_ceil)(double) = NULL;
+MY_VISIBILITY double (*my_floor)(double) = NULL;
+MY_VISIBILITY double (*my_frexp)(double) = NULL;
+MY_VISIBILITY double (*my_ldexp)(double) = NULL;
+MY_VISIBILITY double (*my_modf)(double) = NULL;
 
-void *my_pthread_atfork = NULL;
-void *my_pthread_attr_init = NULL;
-void *my_pthread_attr_destroy = NULL;
-void *my_pthread_cancel = NULL;
-void *my_pthread_cleanup_push = NULL;
-void *my_pthread_cleanup_pop = NULL;
-void *my_pthread_cond_init = NULL;
-void *my_pthread_cond_signal = NULL;
-void *my_pthread_cond_broadcast = NULL;
-void *my_pthread_cond_wait = NULL;
-void *my_pthread_cond_timedwait = NULL;
-void *my_pthread_cond_destroy = NULL;
-void *my_pthread_create = NULL;
-void *my_pthread_detach = NULL;
-void *my_pthread_equal = NULL;
-void *my_pthread_exit = NULL;
-void *my_pthread_key_create = NULL;
-void *my_pthread_key_delete = NULL;
-void *my_pthread_setspecific = NULL;
-void *my_pthread_getspecific = NULL;
-void *my_pthread_kill = NULL;
-void *my_pthread_mutex_lock = NULL;
-void *my_pthread_mutex_unlock = NULL;
-void *my_pthread_mutex_trylock = NULL;
-void *my_pthread_mutex_init = NULL;
-void *my_pthread_mutex_destroy = NULL;
-void *my_pthread_mutexattr_destroy = NULL;
-void *my_pthread_mutexattr_init = NULL;
-void *my_pthread_join = NULL;
+MY_VISIBILITY void *my_pthread_atfork = NULL;
+MY_VISIBILITY void *my_pthread_attr_init = NULL;
+MY_VISIBILITY void *my_pthread_attr_destroy = NULL;
+MY_VISIBILITY void *my_pthread_cancel = NULL;
+MY_VISIBILITY void *my_pthread_cleanup_push = NULL;
+MY_VISIBILITY void *my_pthread_cleanup_pop = NULL;
+MY_VISIBILITY void *my_pthread_cond_init = NULL;
+MY_VISIBILITY void *my_pthread_cond_signal = NULL;
+MY_VISIBILITY void *my_pthread_cond_broadcast = NULL;
+MY_VISIBILITY void *my_pthread_cond_wait = NULL;
+MY_VISIBILITY void *my_pthread_cond_timedwait = NULL;
+MY_VISIBILITY void *my_pthread_cond_destroy = NULL;
+MY_VISIBILITY void *my_pthread_create = NULL;
+MY_VISIBILITY void *my_pthread_detach = NULL;
+MY_VISIBILITY void *my_pthread_equal = NULL;
+MY_VISIBILITY void *my_pthread_exit = NULL;
+MY_VISIBILITY void *my_pthread_key_create = NULL;
+MY_VISIBILITY void *my_pthread_key_delete = NULL;
+MY_VISIBILITY void *my_pthread_setspecific = NULL;
+MY_VISIBILITY void *my_pthread_getspecific = NULL;
+MY_VISIBILITY void *my_pthread_kill = NULL;
+MY_VISIBILITY void *my_pthread_mutex_lock = NULL;
+MY_VISIBILITY void *my_pthread_mutex_unlock = NULL;
+MY_VISIBILITY void *my_pthread_mutex_trylock = NULL;
+MY_VISIBILITY void *my_pthread_mutex_init = NULL;
+MY_VISIBILITY void *my_pthread_mutex_destroy = NULL;
+MY_VISIBILITY void *my_pthread_mutexattr_destroy = NULL;
+MY_VISIBILITY void *my_pthread_mutexattr_init = NULL;
+MY_VISIBILITY void *my_pthread_join = NULL;
 
-void *(*my_dlopen)(const char *, int) = NULL;
-void *(*my_dlsym)(void *restrict, const char *restrict) = NULL;
-int (*my_dlclose)(void *) = NULL;
+MY_VISIBILITY void *(*my_dlopen)(const char *, int) = NULL;
+MY_VISIBILITY void *(*my_dlsym)(void *restrict, const char *restrict) = NULL;
+MY_VISIBILITY int (*my_dlclose)(void *) = NULL;
 
-extern unsigned long g_interp_base;
-
-#include "my_dlfcn.h"
+extern void *gl_interp_base;
 
 /* example */
 
@@ -690,17 +804,77 @@ static void *worker(void *foo)
 	return NULL;
 }
 
+static int submain(void);
+
 /* MUST ensure that stack is 16 byte aligned for calls to external functions */
 /* especially ones with variadic arguments. We do this via the z_fdlentry.S wrapper */
 extern void fdl_entry_impl(void)
 {
-	void *c;
-	void *m;
-	void *p;
+	int cached;
+	void *text_base;
+	const char *cached_name;
+	void *cached_base;
+	const char *soname;
 
 	void *tmp_dlopen;
 	void *tmp_dlsym;
 	void *tmp_dlclose;
+
+	int exit_status;
+
+	mod_t M;
+
+	cached = 0;
+	exit_status = 0;
+	text_base = NULL;
+	cached_name = NULL;
+	cached_base = NULL;
+	soname = NULL;
+
+	if (0 > find_libc_base(&cached, &text_base, &cached_name, &cached_base, &soname)) {
+		if (gl_interp_base != 0) {
+			text_base = gl_interp_base;
+		} else {
+			goto l_exit_failure;
+		}
+	}
+
+	z_memset(&M, 0, sizeof M);
+	if (RARELY(mod_init(&M, text_base) < 0)) {
+		goto l_exit_failure;
+	}
+
+	/* glibc: prefer __libc_dlopen_mode; fallback to dlopen/dlsym */
+
+	tmp_dlopen = resolve_sym(&M, "__libc_dlopen_mode");
+	if (!tmp_dlopen) {
+		tmp_dlopen = resolve_sym(&M, "dlopen");
+	}
+
+	tmp_dlsym = resolve_sym(&M, "dlsym");
+	tmp_dlclose = resolve_sym(&M, "dlclose");
+
+	if ((unsigned int)(!tmp_dlopen) | (unsigned int)(!tmp_dlsym) | (unsigned int)(!tmp_dlclose)) {
+		goto l_exit_failure;
+	}
+
+	my_dlopen = (void *(*)(const char *, int))tmp_dlopen;
+	my_dlsym = (void *(*)(void *restrict, const char *restrict))tmp_dlsym;
+	my_dlclose = (int (*)(void *))tmp_dlclose;
+
+l_exit:
+	sys_exit(exit_status == 0 ? submain() : exit_status);
+
+l_exit_failure:
+	exit_status = 1;
+	goto l_exit;
+}
+
+static int submain(void)
+{
+	void *c;
+	void *m;
+	void *p;
 
 	int (*my_printf)(const char *restrict, ...);
 	float (*my_sinf)(float);
@@ -713,53 +887,16 @@ extern void fdl_entry_impl(void)
 	struct worker_str ws1;
 	struct worker_str ws2;
 	void *dummy;
-	int exit_status;
-
-	mod_t M;
-
-	exit_status = 0;
-
-	if (0 > find_libc_base()) {
-		if (g_interp_base != 0) {
-			text_base = g_interp_base;
-		} else {
-			goto l_exit_failure;
-		}
-	}
-
-	z_memset(&M, 0, sizeof M);
-	if (RARELY(mod_init(&M, text_base) < 0))
-		goto l_exit_failure;
-
-	/* glibc: prefer __libc_dlopen_mode; fallback to dlopen/dlsym */
-
-	tmp_dlopen = resolve_sym(&M, "__libc_dlopen_mode");
-	if (!tmp_dlopen) {
-		tmp_dlopen = resolve_sym(&M, "dlopen");
-	}
-
-	tmp_dlsym = resolve_sym(&M, "dlsym");
-	tmp_dlclose = resolve_sym(&M, "dlclose");
-
-	if (!tmp_dlopen || !tmp_dlsym || !tmp_dlclose) {
-		goto l_exit_failure;
-	}
-
-	my_dlopen = tmp_dlopen;
-	my_dlsym = tmp_dlsym;
-	my_dlclose = tmp_dlclose;
-
-	/* my_dlfcn.h */
 
 	c = dlopen(NULL, RTLD_NOW);
-	my_printf = dlsym(c, "printf");
+	my_printf = (int (*)(const char *restrict, ...))dlsym(c, "printf");
 
 	m = dlopen("libm.so.6", RTLD_NOW);
 	if (RARELY(m == NULL)) {
 		goto l_exit_failure;
 	}
 
-	my_sinf = dlsym(m, "sinf");
+	my_sinf = (float (*)(float))dlsym(m, "sinf");
 	if (RARELY(my_sinf == NULL)) {
 		goto l_exit_failure;
 	}
@@ -790,8 +927,8 @@ extern void fdl_entry_impl(void)
 		goto l_exit_failure;
 	}
 
-	ws1.printff = ws2.printff = my_printf;
-	ws1.sleepf = ws2.sleepf = sleepf;
+	ws1.printff = ws2.printff = (void *)my_printf;
+	ws1.sleepf = ws2.sleepf = (void *)sleepf;
 
 	if (0 != (*(int (*)(unsigned long *, const void *, void *(*)(void *), void *))pth_create)(
 		     &tid1, NULL, worker, &ws1)) {
@@ -815,11 +952,8 @@ extern void fdl_entry_impl(void)
 	(void)dlclose(m);
 	(void)dlclose(c);
 
-l_exit:
-	sys_exit(exit_status);
+	return 0;
 
 l_exit_failure:
-	exit_status = 1;
-	goto l_exit;
+	return 1;
 }
-

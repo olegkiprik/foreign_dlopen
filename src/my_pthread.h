@@ -1,44 +1,48 @@
 #if !defined(MY_PTHREAD_H)
 #define MY_PTHREAD_H
 
-// #define restrict
+#if defined(FOREIGN_DLOPEN_STATIC)
+#define MY_VISIBILITY static
+#else
+#define MY_VISIBILITY extern
+#endif
 
-extern void *my_pthread_atfork;
-extern void *my_pthread_attr_init;
-extern void *my_pthread_attr_destroy;
-extern void *my_pthread_cancel;
-extern void *my_pthread_cleanup_push;
-extern void *my_pthread_cleanup_pop;
+MY_VISIBILITY void *my_pthread_atfork;
+MY_VISIBILITY void *my_pthread_attr_init;
+MY_VISIBILITY void *my_pthread_attr_destroy;
+MY_VISIBILITY void *my_pthread_cancel;
+MY_VISIBILITY void *my_pthread_cleanup_push;
+MY_VISIBILITY void *my_pthread_cleanup_pop;
 
-extern void *my_pthread_cond_init;
-extern void *my_pthread_cond_signal;
-extern void *my_pthread_cond_broadcast;
-extern void *my_pthread_cond_wait;
-extern void *my_pthread_cond_timedwait;
-extern void *my_pthread_cond_destroy;
+MY_VISIBILITY void *my_pthread_cond_init;
+MY_VISIBILITY void *my_pthread_cond_signal;
+MY_VISIBILITY void *my_pthread_cond_broadcast;
+MY_VISIBILITY void *my_pthread_cond_wait;
+MY_VISIBILITY void *my_pthread_cond_timedwait;
+MY_VISIBILITY void *my_pthread_cond_destroy;
 
-extern void *my_pthread_create;
-extern void *my_pthread_detach;
-extern void *my_pthread_equal;
-extern void *my_pthread_exit;
+MY_VISIBILITY void *my_pthread_create;
+MY_VISIBILITY void *my_pthread_detach;
+MY_VISIBILITY void *my_pthread_equal;
+MY_VISIBILITY void *my_pthread_exit;
 
-extern void *my_pthread_key_create;
-extern void *my_pthread_key_delete;
-extern void *my_pthread_setspecific;
-extern void *my_pthread_getspecific;
+MY_VISIBILITY void *my_pthread_key_create;
+MY_VISIBILITY void *my_pthread_key_delete;
+MY_VISIBILITY void *my_pthread_setspecific;
+MY_VISIBILITY void *my_pthread_getspecific;
 
-extern void *my_pthread_kill;
+MY_VISIBILITY void *my_pthread_kill;
 
-extern void *my_pthread_mutex_lock;
-extern void *my_pthread_mutex_unlock;
-extern void *my_pthread_mutex_trylock;
-extern void *my_pthread_mutex_init;
-extern void *my_pthread_mutex_destroy;
+MY_VISIBILITY void *my_pthread_mutex_lock;
+MY_VISIBILITY void *my_pthread_mutex_unlock;
+MY_VISIBILITY void *my_pthread_mutex_trylock;
+MY_VISIBILITY void *my_pthread_mutex_init;
+MY_VISIBILITY void *my_pthread_mutex_destroy;
 
-extern void *my_pthread_mutexattr_destroy;
-extern void *my_pthread_mutexattr_init;
+MY_VISIBILITY void *my_pthread_mutexattr_destroy;
+MY_VISIBILITY void *my_pthread_mutexattr_init;
 
-extern void *my_pthread_join;
+MY_VISIBILITY void *my_pthread_join;
 
 static int pthread_join(unsigned long thread, void **retval)
 {
