@@ -870,6 +870,10 @@ l_exit_failure:
 	goto l_exit;
 }
 
+#if !defined(EINVAL)
+#define	EINVAL		22	/* Invalid argument */
+#endif
+
 static int submain(void)
 {
 	void *c;
@@ -881,6 +885,8 @@ static int submain(void)
 	void *sleepf;
 	void *pth_create;
 	void *pth_join;
+	void *errno_location;
+	void *lseek;
 
 	unsigned long tid1;
 	unsigned long tid2;
@@ -902,6 +908,25 @@ static int submain(void)
 	}
 
 	if (RARELY(my_printf == NULL)) {
+		goto l_exit_failure;
+	}
+
+	errno_location = dlsym(c, "__errno_location");
+	if (RARELY(errno_location == NULL)) {
+		goto l_exit_failure;
+	}
+
+	lseek = dlsym(c, "lseek");
+	if (RARELY(lseek == NULL)) {
+		goto l_exit_failure;
+	}
+
+	if (*(*(int* (*)(void))errno_location)() != 0) {
+		goto l_exit_failure;
+	}
+
+	(*(long (*)(int, long, int))lseek)(0, 0, 0xffffFFFF);
+	if (*(*(int* (*)(void))errno_location)() != EINVAL) {
 		goto l_exit_failure;
 	}
 
